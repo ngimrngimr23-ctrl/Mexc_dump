@@ -27,6 +27,16 @@ def log(msg, tag="INFO"):
 # лежит в открытом git — отзови его через @BotFather и задай новый через env.
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8145739398:AAG3dl79hQnSsTe1KoYGt9hvaaUsR3XXllY").strip()
 
+# Версия кода. Видна в /start, /s и в логе при старте — чтобы сразу отвечать
+# на вопрос «какой код реально крутится на этом сервисе».
+# Поднимать вручную при заметных правках.
+CODE_VERSION = "2026-09-13 memes+cg"
+
+# Render сам подставляет эти переменные в окружение сервиса.
+RENDER_SERVICE = os.environ.get("RENDER_SERVICE_NAME", "")
+RENDER_BRANCH = os.environ.get("RENDER_GIT_BRANCH", "")
+RENDER_COMMIT = os.environ.get("RENDER_GIT_COMMIT", "")[:7]
+
 STATE_FILE = os.environ.get("STATE_FILE", "filters_state.json")
 EXCHANGE_INFO_URL = "https://api.mexc.com/api/v3/exchangeInfo"
 
@@ -198,7 +208,8 @@ async def start_cmd(message: types.Message):
     settings["chat_id"] = message.chat.id
     save_state()
     await message.answer(
-        "🚀 <b>Бот-сканер MEXC запущен</b>\n\n"
+        "🚀 <b>Бот-сканер MEXC запущен</b>\n"
+        f"<code>{version_line()}</code>\n\n"
         f"📉 Порог окна: <b>{settings['percent']}%</b>\n"
         f"⏱ Порог за 1 час: <b>{settings['hour_percent']}%</b>\n"
         f"📅 Порог 24ч: <b>{settings['day_drop']}%</b>\n"
@@ -325,6 +336,18 @@ async def set_volume(message: types.Message, command: CommandObject):
 def fmt_max(val):
     """'Выкл' или '-30.0%' — вынесено из f-строк ради Python < 3.12."""
     return "Выкл" if val == 0 else "-%s%%" % val
+
+
+def version_line():
+    """Короткая строка «что именно запущено»."""
+    parts = [CODE_VERSION]
+    if RENDER_SERVICE:
+        parts.append("сервис %s" % RENDER_SERVICE)
+    if RENDER_BRANCH:
+        parts.append("ветка %s" % RENDER_BRANCH)
+    if RENDER_COMMIT:
+        parts.append("коммит %s" % RENDER_COMMIT)
+    return " | ".join(parts)
 
 
 def _ago(stamp):
@@ -532,6 +555,7 @@ async def status_cmd(message: types.Message):
         f"🕒 Обновлено: {info_age()}\n"
         f"❗ Ошибка API: {info_last_error or 'нет'}\n"
         f"🛠 Ручной ЧС: {len(blacklist)} | Исключения: {len(allowlist)}\n"
+        f"🧩 Версия: {version_line()}\n"
         f"💾 Хранилище: {storage.describe()}\n"
         f"📥 Прочитано из: {storage_source}\n"
         f"❗ Ошибка хранилища: {storage_error or 'нет'}"
@@ -899,6 +923,7 @@ async def handle_ping(request): return web.Response(text="OK", status=200)
 
 async def main():
     log("=== старт бота ===")
+    log("версия кода: %s" % version_line())
     log("хранилище: %s" % storage.describe())
     await load_state()
     apply_env_overrides()
