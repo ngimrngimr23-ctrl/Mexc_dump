@@ -30,7 +30,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8145739398:AAG3dl79hQnSsTe1KoYGt9hvaaUs
 # Версия кода. Видна в /start, /s и в логе при старте — чтобы сразу отвечать
 # на вопрос «какой код реально крутится на этом сервисе».
 # Поднимать вручную при заметных правках.
-CODE_VERSION = "2026-09-13 memes+cg"
+CODE_VERSION = "2026-09-21 3d-thresholds"
 
 # Render сам подставляет эти переменные в окружение сервиса.
 RENDER_SERVICE = os.environ.get("RENDER_SERVICE_NAME", "")
@@ -49,6 +49,8 @@ settings = {
     "min_volume": 100000,    # Мин. объем 24ч ($)
     "day_drop": 0.0,         # Порог падения за 24ч (%) (0 - выключено)
     "cooldown_min": 5,       # Минимальная пауза от спама (мин)
+    "day3_min_drop": 0.0,    # МИН. порог падения за 3 дня (0 - выключено)
+    "day3_drop": 0.0,        # МАКС. падение за 3 дня (0 - выключено)
     "week_min_drop": 0.0,    # МИН. порог падения за 7 дней (0 - выключено)
     "week_drop": 0.0,        # МАКС. падение за 7 дней (0 - выключено)
     "month_min_drop": 0.0,   # МИН. порог падения за 30 дней (0 - выключено)
@@ -153,6 +155,9 @@ async def load_state():
     for key in ("chat_id", "channel_id"):
         if data.get(key):
             settings[key] = data[key]
+    for key in ("day3_min_drop", "day3_drop"):
+        if key in data:
+            settings[key] = float(data[key])
     log("состояние загружено из «%s»: ЧС=%d, allowlist=%d, skip_memes=%s"
         % (storage_source, len(blacklist), len(allowlist), settings["skip_memes"]))
 
@@ -170,6 +175,8 @@ def _state_payload():
         "chat_id": settings["chat_id"],
         "channel_id": settings["channel_id"],
         "use_coingecko": settings["use_coingecko"],
+        "day3_min_drop": settings["day3_min_drop"],
+        "day3_drop": settings["day3_drop"],
         "cg_symbols": sorted(cg_symbols),
         "cg_last_refresh": cg_last_refresh,
     }
@@ -214,8 +221,10 @@ async def start_cmd(message: types.Message):
         f"📉 Порог окна: <b>{settings['percent']}%</b>\n"
         f"⏱ Порог за 1 час: <b>{settings['hour_percent']}%</b>\n"
         f"📅 Порог 24ч: <b>{fmt_min(settings['day_drop'])}</b>\n"
-        f"📆 Мин. порог 7д: <b>{settings['week_min_drop']}%</b>\n"
-        f"🗓 Мин. порог 30д: <b>{settings['month_min_drop']}%</b>\n"
+        f"📆 Мин. порог 3д: <b>{fmt_min(settings['day3_min_drop'])}</b>\n"
+        f"📆 Мин. порог 7д: <b>{fmt_min(settings['week_min_drop'])}</b>\n"
+        f"🗓 Мин. порог 30д: <b>{fmt_min(settings['month_min_drop'])}</b>\n"
+        f"📆 Фильтр макс 3д: <b>{fmt_max(settings['day3_drop'])}</b>\n"
         f"📆 Фильтр макс 7д: <b>{fmt_max(settings['week_drop'])}</b>\n"
         f"🗓 Фильтр макс 30д: <b>{fmt_max(settings['month_drop'])}</b>\n"
         f"💰 Мин. объём: <b>{settings['min_volume']:,}$</b>\n"
@@ -225,6 +234,8 @@ async def start_cmd(message: types.Message):
         "/p 5 — % падения в окне\n"
         "/ph 8 — % падения за 1 час\n"
         "/d 5 — мин. % падения за 24ч\n"
+        "/d3min 8 — мин. % падения за 3 дня (0=выкл)\n"
+        "/d3 40 — скрыть, если упала >40% за 3 дня (0=выкл)\n"
         "/wmin 10 — мин. % падения за 7 дней (0=выкл)\n"
         "/mmin 20 — мин. % падения за 30 дней (0=выкл)\n"
         "/w 30 — скрыть, если упала >30% за 7 дней (0=выкл)\n"
@@ -284,6 +295,32 @@ async def set_day_drop(message: types.Message, command: CommandObject):
             await message.answer(f"✅ Фильтр 24ч: монета должна быть в минусе минимум на "
                                  f"<b>{settings['day_drop']}%</b> за 24ч", parse_mode="HTML")
     except: await message.answer("❌ Ошибка. Пример: /d 5 (для отключения введи /d 0)")
+
+@dp.message(Command("d3min"))
+async def set_day3_min_drop(message: types.Message, command: CommandObject):
+    try:
+        val = float(command.args.replace(',', '.'))
+        settings["day3_min_drop"] = -abs(val) if val != 0 else 0.0
+        if val == 0:
+            await message.answer("✅ Мин. порог падения за 3 дня <b>ВЫКЛЮЧЕН</b>", parse_mode="HTML")
+        else:
+            await message.answer(f"✅ Порог за 3 дня: монета должна упасть минимум на "
+                                 f"<b>{settings['day3_min_drop']}%</b>", parse_mode="HTML")
+    except: await message.answer("❌ Ошибка. Пример: /d3min 8 (для отключения введи /d3min 0)")
+
+
+@dp.message(Command("d3"))
+async def set_day3_drop(message: types.Message, command: CommandObject):
+    try:
+        val = abs(float(command.args.replace(',', '.')))
+        settings["day3_drop"] = val
+        if val == 0:
+            await message.answer("✅ Макс. фильтр 3 дня <b>ВЫКЛЮЧЕН</b>", parse_mode="HTML")
+        else:
+            await message.answer(f"✅ Макс. фильтр 3 дня: скрывать монеты, упавшие больше чем на "
+                                 f"<b>-{val}%</b>", parse_mode="HTML")
+    except: await message.answer("❌ Ошибка. Пример: /d3 40 (для отключения введи /d3 0)")
+
 
 @dp.message(Command("wmin"))
 async def set_week_min_drop(message: types.Message, command: CommandObject):
@@ -553,8 +590,10 @@ async def status_cmd(message: types.Message):
         f"📉 Окно: {settings['percent']}% ({settings['window_min']}м)\n"
         f"⏱ За 1 час: {settings['hour_percent']}%\n"
         f"📅 24ч (мин): {fmt_min(settings['day_drop'])}\n"
-        f"📆 7 дней (мин): {settings['week_min_drop']}%\n"
-        f"🗓 30 дней (мин): {settings['month_min_drop']}%\n"
+        f"📆 3 дня (мин): {fmt_min(settings['day3_min_drop'])}\n"
+        f"📆 3 дня (макс): {fmt_max(settings['day3_drop'])}\n"
+        f"📆 7 дней (мин): {fmt_min(settings['week_min_drop'])}\n"
+        f"🗓 30 дней (мин): {fmt_min(settings['month_min_drop'])}\n"
         f"📆 7 дней (макс): {fmt_max(settings['week_drop'])}\n"
         f"🗓 30 дней (макс): {fmt_max(settings['month_drop'])}\n"
         f"💰 Объём: {settings['min_volume']:,}$\n"
@@ -594,18 +633,21 @@ async def get_long_term_changes(symbol, current_price):
             async with session.get(url, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if not data: return 0.0, 0.0
+                    if not data: return 0.0, 0.0, 0.0
                     # Если монета новая, берем самую старую доступную свечу
+                    idx_3 = -4 if len(data) >= 4 else 0
                     idx_7 = -8 if len(data) >= 8 else 0
                     idx_30 = -31 if len(data) >= 31 else 0
+                    p_3 = float(data[idx_3][1])   # Цена открытия 3 дня назад
                     p_7 = float(data[idx_7][1])   # Цена открытия 7 дней назад
                     p_30 = float(data[idx_30][1]) # Цена открытия 30 дней назад
+                    c_3 = ((current_price - p_3) / p_3) * 100
                     c_7 = ((current_price - p_7) / p_7) * 100
                     c_30 = ((current_price - p_30) / p_30) * 100
-                    return c_7, c_30
+                    return c_3, c_7, c_30
     except:
         pass
-    return 0.0, 0.0
+    return 0.0, 0.0, 0.0
 
 async def refresh_coingecko(force=False):
     """Раз в сутки тянет категорию meme-token. Возвращает True, если список
@@ -769,11 +811,15 @@ async def process_candidates(candidates, stats, now):
     for cand, res in zip(candidates, results):
         pair = cand["pair"]
         if isinstance(res, Exception):
-            log("свечи для %s не пришли: %r — считаю 7д/30д нулями" % (pair, res), "ERR")
-            ch_7, ch_30 = 0.0, 0.0
+            log("свечи для %s не пришли: %r — считаю 3д/7д/30д нулями" % (pair, res), "ERR")
+            ch_3, ch_7, ch_30 = 0.0, 0.0, 0.0
         else:
-            ch_7, ch_30 = res
+            ch_3, ch_7, ch_30 = res
 
+        if settings["day3_min_drop"] != 0 and ch_3 > settings["day3_min_drop"]:
+            continue  # Упала недостаточно за 3 дня
+        if settings["day3_drop"] > 0 and ch_3 < -settings["day3_drop"]:
+            continue  # Упала слишком сильно за 3 дня (отсев)
         if settings["week_min_drop"] != 0 and ch_7 > settings["week_min_drop"]:
             continue  # Упала недостаточно за неделю
         if settings["month_min_drop"] != 0 and ch_30 > settings["month_min_drop"]:
@@ -807,6 +853,7 @@ async def process_candidates(candidates, stats, now):
             f"📉 В окне: <b>-{drop:.2f}%</b>\n"
             f"⏱ За 1 час: <b>-{hour_drop:.2f}%</b>\n"
             f"📊 За 24 часа: <b>{ch_24:.2f}%</b>\n"
+            f"📆 За 3 дня (до дампа): <b>{ch_3:.2f}%</b>\n"
             f"📆 За 7 дней (до дампа): <b>{ch_7:.2f}%</b>\n"
             f"🗓 За 30 дней (до дампа): <b>{ch_30:.2f}%</b>\n"
             f"💵 Было (пик): <code>{max_p}</code>\n"
