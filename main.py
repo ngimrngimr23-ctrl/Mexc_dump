@@ -30,7 +30,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8145739398:AAG3dl79hQnSsTe1KoYGt9hvaaUs
 # Версия кода. Видна в /start, /s и в логе при старте — чтобы сразу отвечать
 # на вопрос «какой код реально крутится на этом сервисе».
 # Поднимать вручную при заметных правках.
-CODE_VERSION = "2026-09-21 3d-thresholds"
+CODE_VERSION = "2026-09-21 set-config"
 
 # Render сам подставляет эти переменные в окружение сервиса.
 RENDER_SERVICE = os.environ.get("RENDER_SERVICE_NAME", "")
@@ -251,15 +251,26 @@ async def start_cmd(message: types.Message):
         "/cg on|off|refresh — второй источник мемов (CoinGecko)\n"
         "/why DOGE — почему монета проходит/не проходит\n"
         "/channel @имя_канала — куда дублировать сигналы (пусто = выкл)\n"
-        "/s — статус"
+        "/set p=5 t=5 — менять несколько настроек разом\n"
+        "/config — строка настроек для копирования\n"
+        "/s — статус\n\n"
+        "📋 <b>Скопировать текущие настройки</b>\n"
+        "<i>нажми на строку, потом вставь и отправь — применятся все сразу:</i>\n"
+        f"<code>{config_line()}</code>"
         , parse_mode="HTML")
 
 @dp.message(Command("channel"))
 async def set_channel(message: types.Message, command: CommandObject):
     if command.args:
-        settings["channel_id"] = command.args
+        settings["channel_id"] = norm_channel(command.args)
         save_state()
-        await message.answer(f"✅ Канал для сигналов установлен: <b>{command.args}</b>\n<i>Не забудь сделать бота администратором в этом канале!</i>", parse_mode="HTML")
+        note = ""
+        if settings["channel_id"] != command.args.strip():
+            note = f"\n<i>Ссылку привёл к виду {settings['channel_id']} — Bot API понимает только @имя или числовой id.</i>"
+        await message.answer(
+            f"✅ Канал для сигналов установлен: <b>{settings['channel_id']}</b>{note}"
+            "\n<i>Не забудь сделать бота администратором в этом канале!</i>",
+            parse_mode="HTML")
     else:
         settings["channel_id"] = None
         save_state()
@@ -377,6 +388,116 @@ async def set_volume(message: types.Message, command: CommandObject):
     if command.args and command.args.isdigit():
         settings["min_volume"] = int(command.args)
         await message.answer(f"✅ Объём: <b>{settings['min_volume']:,}$</b>", parse_mode="HTML")
+
+def norm_channel(raw):
+    """'https://t.me/name', 't.me/name', 'name' -> '@name'.
+    Числовой id (-100...) и '@name' оставляем как есть: Bot API принимает
+    только @username или числовой id, ссылка t.me даёт «chat not found»."""
+    val = (raw or "").strip()
+    if not val:
+        return None
+    low = val.lower()
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/", "telegram.me/"):
+        if low.startswith(prefix):
+            val = val[len(prefix):]
+            break
+    val = val.split("?")[0].strip("/")
+    if not val:
+        return None
+    if val.startswith("@") or val.lstrip("-").isdigit():
+        return val
+    return "@" + val
+
+
+# Описание настроек для /set и для строки «скопировать настройки».
+# вид: ключ -> (поле, тип). Типы:
+#   pos  — положительное число (порог срабатывания, максимальные фильтры)
+#   neg  — хранится отрицательным, вводится положительным, 0 = выкл
+#   int  — целое
+#   bool — on/off
+#   text — строка
+SET_SPEC = (
+    ("p",       "percent",        "pos"),
+    ("ph",      "hour_percent",   "pos"),
+    ("t",       "window_min",     "int"),
+    ("v",       "min_volume",     "int"),
+    ("d",       "day_drop",       "neg"),
+    ("d3min",   "day3_min_drop",  "neg"),
+    ("d3",      "day3_drop",      "pos"),
+    ("wmin",    "week_min_drop",  "neg"),
+    ("w",       "week_drop",      "pos"),
+    ("mmin",    "month_min_drop", "neg"),
+    ("m",       "month_drop",     "pos"),
+    ("memes",   "skip_memes",     "bool"),
+    ("cg",      "use_coingecko",  "bool"),
+    ("channel", "channel_id",     "text"),
+)
+SET_BY_KEY = {k: (field, kind) for k, field, kind in SET_SPEC}
+
+
+def _num(val):
+    """5.0 -> '5', 7.5 -> '7.5' — чтобы строка настроек читалась."""
+    return str(int(val)) if float(val) == int(val) else str(val)
+
+
+def config_line():
+    """Текущие настройки одной командой — для копирования одним касанием."""
+    parts = []
+    for key, field, kind in SET_SPEC:
+        val = settings[field]
+        if kind == "bool":
+            parts.append("%s=%s" % (key, "on" if val else "off"))
+        elif kind == "text":
+            if val:
+                parts.append("%s=%s" % (key, val))
+        elif kind == "neg":
+            parts.append("%s=%s" % (key, _num(abs(val))))
+        elif kind == "int":
+            parts.append("%s=%d" % (key, val))
+        else:
+            parts.append("%s=%s" % (key, _num(val)))
+    return "/set " + " ".join(parts)
+
+
+def apply_setting(key, raw):
+    """Применяет одну пару ключ=значение. Возвращает (описание, ошибка)."""
+    if key not in SET_BY_KEY:
+        return None, "неизвестный параметр «%s»" % key
+    field, kind = SET_BY_KEY[key]
+
+    if kind == "bool":
+        low = raw.lower()
+        if low in ("on", "вкл", "1", "true", "да"):
+            settings[field] = True
+        elif low in ("off", "выкл", "0", "false", "нет"):
+            settings[field] = False
+        else:
+            return None, "%s: нужно on или off, а не «%s»" % (key, raw)
+        return "%s=%s" % (key, "on" if settings[field] else "off"), None
+
+    if kind == "text":
+        if raw.lower() in ("off", "выкл", "-", "нет"):
+            settings[field] = None
+            return "%s=выкл" % key, None
+        settings[field] = norm_channel(raw)
+        return "%s=%s" % (key, settings[field]), None
+
+    try:
+        val = float(raw.replace(",", "."))
+    except ValueError:
+        return None, "%s: «%s» не число" % (key, raw)
+
+    if kind == "int":
+        if val < 0:
+            return None, "%s: не может быть отрицательным" % key
+        settings[field] = int(val)
+        return "%s=%d" % (key, settings[field]), None
+    if kind == "neg":
+        settings[field] = -abs(val) if val != 0 else 0.0
+        return "%s=%s" % (key, _num(abs(val))), None
+    settings[field] = abs(val)
+    return "%s=%s" % (key, _num(settings[field])), None
+
 
 def fmt_min(val):
     """Порог «минимум столько-то падения»: 0 означает выключено."""
@@ -582,6 +703,62 @@ async def why_coin(message: types.Message, command: CommandObject):
         verdict = "СКАНИРУЕТСЯ"
     lines.append(f"\n📌 Итог: <b>{verdict}</b>")
     await message.answer("\n".join(lines), parse_mode="HTML")
+
+@dp.message(Command("set"))
+async def set_bulk(message: types.Message, command: CommandObject):
+    if not command.args:
+        return await message.answer(
+            "⚙️ <b>Все настройки одной командой</b>\n"
+            "Нажми на строку ниже — она скопируется, потом вставь и отправь:\n\n"
+            f"<code>{config_line()}</code>\n\n"
+            "Можно менять и по одному: <code>/set p=5 t=5</code>",
+            parse_mode="HTML")
+
+    was_cg = settings["use_coingecko"]
+    was_memes = settings["skip_memes"]
+    applied, errors = [], []
+
+    for token in command.args.split():
+        if "=" not in token:
+            errors.append("«%s» — нужно в виде ключ=значение" % token)
+            continue
+        key, _, raw = token.partition("=")
+        done, err = apply_setting(key.strip().lstrip("/").lower(), raw.strip())
+        (applied if done else errors).append(done or err)
+
+    if applied:
+        save_state()
+        log("массовая настройка: %s" % ", ".join(applied), "CMD")
+
+    text = ""
+    if applied:
+        text += "✅ <b>Применено (%d):</b>\n<code>%s</code>\n" % (
+            len(applied), "  ".join(applied))
+    if errors:
+        text += "\n⚠️ <b>Пропущено (%d):</b>\n%s\n" % (
+            len(errors), "\n".join("• " + e for e in errors))
+    if not applied and not errors:
+        text = "Нечего применять."
+    await message.answer(text, parse_mode="HTML")
+
+    if applied and settings["skip_memes"] != was_memes:
+        await refresh_exchange_info(force=True)
+    if applied and settings["use_coingecko"] != was_cg:
+        if settings["use_coingecko"] and not cg_symbols:
+            # Список пуст — тянем в фоне, чтобы не держать ответ команды.
+            asyncio.create_task(refresh_coingecko(force=True))
+        else:
+            await refresh_exchange_info(force=True)
+
+
+@dp.message(Command("config"))
+async def show_config(message: types.Message):
+    await message.answer(
+        "📋 <b>Текущие настройки</b>\n"
+        "Нажми, чтобы скопировать, потом вставь и отправь — применятся разом:\n\n"
+        f"<code>{config_line()}</code>",
+        parse_mode="HTML")
+
 
 @dp.message(Command("s"))
 async def status_cmd(message: types.Message):
