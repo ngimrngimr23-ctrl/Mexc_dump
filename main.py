@@ -39,6 +39,7 @@ RENDER_COMMIT = os.environ.get("RENDER_GIT_COMMIT", "")[:7]
 
 STATE_FILE = os.environ.get("STATE_FILE", "filters_state.json")
 EXCHANGE_INFO_URL = "https://api.mexc.com/api/v3/exchangeInfo"
+KLINE_CONCURRENCY = 10   # сколько запросов свечей держать одновременно
 
 settings = {
     "percent": 5.0,          # Порог падения в окне (%)
@@ -46,7 +47,7 @@ settings = {
     "hour_percent": 10.0,    # Порог падения за 1 час (%)
     "check_interval": 30,    # Как часто проверять (сек)
     "min_volume": 100000,    # Мин. объем 24ч ($)
-    "day_drop": 0.0,         # Порог падения за 24ч (%)
+    "day_drop": 0.0,         # Порог падения за 24ч (%) (0 - выключено)
     "cooldown_min": 5,       # Минимальная пауза от спама (мин)
     "week_min_drop": 0.0,    # МИН. порог падения за 7 дней (0 - выключено)
     "week_drop": 0.0,        # МАКС. падение за 7 дней (0 - выключено)
@@ -212,7 +213,7 @@ async def start_cmd(message: types.Message):
         f"<code>{version_line()}</code>\n\n"
         f"📉 Порог окна: <b>{settings['percent']}%</b>\n"
         f"⏱ Порог за 1 час: <b>{settings['hour_percent']}%</b>\n"
-        f"📅 Порог 24ч: <b>{settings['day_drop']}%</b>\n"
+        f"📅 Порог 24ч: <b>{fmt_min(settings['day_drop'])}</b>\n"
         f"📆 Мин. порог 7д: <b>{settings['week_min_drop']}%</b>\n"
         f"🗓 Мин. порог 30д: <b>{settings['month_min_drop']}%</b>\n"
         f"📆 Фильтр макс 7д: <b>{fmt_max(settings['week_drop'])}</b>\n"
@@ -273,9 +274,16 @@ async def set_hour_percent(message: types.Message, command: CommandObject):
 async def set_day_drop(message: types.Message, command: CommandObject):
     try:
         val = float(command.args.replace(',', '.'))
-        settings["day_drop"] = -abs(val)
-        await message.answer(f"✅ Фильтр 24ч: <b>{settings['day_drop']}%</b>", parse_mode="HTML")
-    except: await message.answer("❌ Ошибка. Пример: /d 5")
+        settings["day_drop"] = -abs(val) if val != 0 else 0.0
+        if val == 0:
+            await message.answer(
+                "✅ Фильтр 24ч <b>ВЫКЛЮЧЕН</b>\n"
+                "<i>Теперь ловятся и ножи на монетах, которые за сутки в плюсе.</i>",
+                parse_mode="HTML")
+        else:
+            await message.answer(f"✅ Фильтр 24ч: монета должна быть в минусе минимум на "
+                                 f"<b>{settings['day_drop']}%</b> за 24ч", parse_mode="HTML")
+    except: await message.answer("❌ Ошибка. Пример: /d 5 (для отключения введи /d 0)")
 
 @dp.message(Command("wmin"))
 async def set_week_min_drop(message: types.Message, command: CommandObject):
@@ -332,6 +340,11 @@ async def set_volume(message: types.Message, command: CommandObject):
     if command.args and command.args.isdigit():
         settings["min_volume"] = int(command.args)
         await message.answer(f"✅ Объём: <b>{settings['min_volume']:,}$</b>", parse_mode="HTML")
+
+def fmt_min(val):
+    """Порог «минимум столько-то падения»: 0 означает выключено."""
+    return "Выкл" if val == 0 else "%s%%" % val
+
 
 def fmt_max(val):
     """'Выкл' или '-30.0%' — вынесено из f-строк ради Python < 3.12."""
@@ -539,7 +552,7 @@ async def status_cmd(message: types.Message):
         "📊 <b>Статус</b>\n"
         f"📉 Окно: {settings['percent']}% ({settings['window_min']}м)\n"
         f"⏱ За 1 час: {settings['hour_percent']}%\n"
-        f"📅 24ч (мин): {settings['day_drop']}%\n"
+        f"📅 24ч (мин): {fmt_min(settings['day_drop'])}\n"
         f"📆 7 дней (мин): {settings['week_min_drop']}%\n"
         f"🗓 30 дней (мин): {settings['month_min_drop']}%\n"
         f"📆 7 дней (макс): {fmt_max(settings['week_drop'])}\n"
@@ -735,6 +748,87 @@ async def refresh_exchange_info(force=False):
             % (len(guessed), ", ".join(shown), tail), "CHECK")
 
 
+async def process_candidates(candidates, stats, now):
+    """Догружает 7/30-дневную историю параллельно, фильтрует и рассылает сигналы."""
+    if not candidates:
+        return
+
+    sem = asyncio.Semaphore(KLINE_CONCURRENCY)
+
+    async def fetch(cand):
+        async with sem:
+            return await get_long_term_changes(cand["pair"], cand["max_p"])
+
+    started = time.time()
+    results = await asyncio.gather(*(fetch(c) for c in candidates),
+                                   return_exceptions=True)
+    if len(candidates) > 1:
+        log("свечей запрошено %d за %.1f с (параллельно, до %d разом)"
+            % (len(candidates), time.time() - started, KLINE_CONCURRENCY), "DEBUG")
+
+    for cand, res in zip(candidates, results):
+        pair = cand["pair"]
+        if isinstance(res, Exception):
+            log("свечи для %s не пришли: %r — считаю 7д/30д нулями" % (pair, res), "ERR")
+            ch_7, ch_30 = 0.0, 0.0
+        else:
+            ch_7, ch_30 = res
+
+        if settings["week_min_drop"] != 0 and ch_7 > settings["week_min_drop"]:
+            continue  # Упала недостаточно за неделю
+        if settings["month_min_drop"] != 0 and ch_30 > settings["month_min_drop"]:
+            continue  # Упала недостаточно за месяц
+        if settings["week_drop"] > 0 and ch_7 < -settings["week_drop"]:
+            continue  # Упала слишком сильно за неделю (отсев)
+        if settings["month_drop"] > 0 and ch_30 < -settings["month_drop"]:
+            continue  # Упала слишком сильно за месяц
+
+        price = cand["price"]
+        daily_memory[pair] = {
+            "time": daily_memory[pair]["time"] if pair in daily_memory else now,
+            "price": price,
+            "last_msg": now,
+        }
+
+        label = "🔥 <b>ПОВТОРНЫЙ ДАМП (x2)</b>\n" if cand["is_repeat"] else ""
+        if cand["window_trigger"] and cand["hour_trigger"]:
+            trigger_label = "⚡ Триггер: окно + 1 час\n"
+        elif cand["hour_trigger"]:
+            trigger_label = "⚡ Триггер: падение за 1 час\n"
+        else:
+            trigger_label = "⚡ Триггер: окно\n"
+
+        base_coin = pair[:-4]
+        drop, hour_drop = cand["drop"], cand["hour_drop"]
+        ch_24, vol, max_p = cand["ch_24"], cand["vol"], cand["max_p"]
+
+        alert_text = (
+            f"🚨 <b>ДАМП: <code>{base_coin}</code></b>\n{label}{trigger_label}"
+            f"📉 В окне: <b>-{drop:.2f}%</b>\n"
+            f"⏱ За 1 час: <b>-{hour_drop:.2f}%</b>\n"
+            f"📊 За 24 часа: <b>{ch_24:.2f}%</b>\n"
+            f"📆 За 7 дней (до дампа): <b>{ch_7:.2f}%</b>\n"
+            f"🗓 За 30 дней (до дампа): <b>{ch_30:.2f}%</b>\n"
+            f"💵 Было (пик): <code>{max_p}</code>\n"
+            f"💸 Стало (тек): <code>{price}</code>\n"
+            f"💰 Объём: <b>{int(vol):,}$</b>"
+        )
+
+        stats["сигналы"] += 1
+        log("СИГНАЛ %s: окно -%.2f%%, час -%.2f%%, 24ч %.2f%%, объём %d$"
+            % (base_coin, drop, hour_drop, ch_24, int(vol)), "ALERT")
+        try:
+            await bot.send_message(settings["chat_id"], alert_text, parse_mode="HTML")
+        except Exception as e:
+            log("не отправилось админу: %r" % e, "ERR")
+
+        if settings["channel_id"]:
+            try:
+                await bot.send_message(settings["channel_id"], alert_text, parse_mode="HTML")
+            except Exception as e:
+                log("не отправилось в канал %s: %r" % (settings["channel_id"], e), "ERR")
+
+
 async def parser_task():
     log("--- Фоновый парсер запущен ---")
     while True:
@@ -749,6 +843,7 @@ async def parser_task():
                     log("пустой ответ /ticker/24hr — пропускаю цикл", "ERR")
                 now = time.time()
                 stats = Counter()
+                candidates = []
                 max_pts = int((settings["window_min"] * 60) / settings["check_interval"])
                 max_pts_hour = max(1, int(3600 / settings["check_interval"]))
                 cooldown_sec = settings["cooldown_min"] * 60
@@ -828,7 +923,8 @@ async def parser_task():
                     hour_trigger = hour_drop >= settings["hour_percent"]
 
                     # Проверка базовых условий (срабатывает окно ИЛИ часовой порог)
-                    if (window_trigger or hour_trigger) and ch_24 <= settings["day_drop"]:
+                    day_ok = settings["day_drop"] == 0 or ch_24 <= settings["day_drop"]
+                    if (window_trigger or hour_trigger) and day_ok:
                         should_alert = True
                         is_repeat = False
 
@@ -845,66 +941,21 @@ async def parser_task():
                                     should_alert = False
 
                         if should_alert:
-                            # ЗАПРАШИВАЕМ ИСТОРИЮ ЗА НЕДЕЛЮ И МЕСЯЦ (считаем от max_p до начала дампа)
-                            ch_7, ch_30 = await get_long_term_changes(pair, max_p)
-
-                            # Применяем дополнительные фильтры
-                            if settings["week_min_drop"] != 0 and ch_7 > settings["week_min_drop"]:
-                                should_alert = False  # Упала недостаточно за неделю
-                            elif settings["month_min_drop"] != 0 and ch_30 > settings["month_min_drop"]:
-                                should_alert = False  # Упала недостаточно за месяц
-                            elif settings["week_drop"] > 0 and ch_7 < -settings["week_drop"]:
-                                should_alert = False  # Упала слишком сильно за неделю (отсев)
-                            elif settings["month_drop"] > 0 and ch_30 < -settings["month_drop"]:
-                                should_alert = False  # Упала слишком сильно за месяц
-
-                            if should_alert:
-                                daily_memory[pair] = {
-                                    "time": daily_memory[pair]["time"] if pair in daily_memory else now,
-                                    "price": price,
-                                    "last_msg": now
-                                }
-
-                                label = "🔥 <b>ПОВТОРНЫЙ ДАМП (x2)</b>\n" if is_repeat else ""
-
-                                if window_trigger and hour_trigger:
-                                    trigger_label = "⚡ Триггер: окно + 1 час\n"
-                                elif hour_trigger:
-                                    trigger_label = "⚡ Триггер: падение за 1 час\n"
-                                else:
-                                    trigger_label = "⚡ Триггер: окно\n"
-
-                                # Убираем USDT из названия монеты для уведомления
-                                base_coin = pair.replace("USDT", "")
-
-                                # Формируем текст сообщения
-                                alert_text = (
-                                    f"🚨 <b>ДАМП: <code>{base_coin}</code></b>\n{label}{trigger_label}"
-                                    f"📉 В окне: <b>-{drop:.2f}%</b>\n"
-                                    f"⏱ За 1 час: <b>-{hour_drop:.2f}%</b>\n"
-                                    f"📊 За 24 часа: <b>{ch_24:.2f}%</b>\n"
-                                    f"📆 За 7 дней (до дампа): <b>{ch_7:.2f}%</b>\n"
-                                    f"🗓 За 30 дней (до дампа): <b>{ch_30:.2f}%</b>\n"
-                                    f"💵 Было (пик): <code>{max_p}</code>\n"
-                                    f"💸 Стало (тек): <code>{price}</code>\n"
-                                    f"💰 Объём: <b>{int(vol):,}$</b>"
-                                )
-
-                                # 1. Отправляем в чат админа
-                                stats["сигналы"] += 1
-                                log("СИГНАЛ %s: окно -%.2f%%, час -%.2f%%, 24ч %.2f%%, объём %d$"
-                                    % (base_coin, drop, hour_drop, ch_24, int(vol)), "ALERT")
-                                await bot.send_message(settings["chat_id"], alert_text, parse_mode="HTML")
-
-                                # 2. Дублируем в канал
-                                if settings["channel_id"]:
-                                    try:
-                                        await bot.send_message(settings["channel_id"], alert_text, parse_mode="HTML")
-                                    except Exception as e:
-                                        log("не отправилось в канал %s: %r" % (settings["channel_id"], e), "ERR")
+                            # Свечи за 7/30 дней не запрашиваем здесь: при низком
+                            # пороге кандидатов десятки, и последовательные запросы
+                            # растянули бы цикл. Копим и забираем разом после цикла.
+                            candidates.append({
+                                "pair": pair, "price": price, "max_p": max_p,
+                                "drop": drop, "hour_drop": hour_drop, "ch_24": ch_24,
+                                "vol": vol, "is_repeat": is_repeat,
+                                "window_trigger": window_trigger,
+                                "hour_trigger": hour_trigger,
+                            })
 
                     history.append(price)
                     history_hour.append(price)
+
+                await process_candidates(candidates, stats, now)
 
                 log("usdt=%d мемы=%d чс=%d неторг=%d объём_мал=%d битые=%d "
                     "анализ=%d (из них с меткой ST %d) сигналы=%d"
