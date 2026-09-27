@@ -2,6 +2,7 @@ import asyncio
 import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, CommandObject
+from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
 from aiohttp import web
 import time
 import json
@@ -30,7 +31,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8145739398:AAG3dl79hQnSsTe1KoYGt9hvaaUs
 # Версия кода. Видна в /start, /s и в логе при старте — чтобы сразу отвечать
 # на вопрос «какой код реально крутится на этом сервисе».
 # Поднимать вручную при заметных правках.
-CODE_VERSION = "2026-09-21 set-config"
+CODE_VERSION = "2026-09-27 polling-diag"
 
 # Render сам подставляет эти переменные в окружение сервиса.
 RENDER_SERVICE = os.environ.get("RENDER_SERVICE_NAME", "")
@@ -80,6 +81,8 @@ storage_error = ""
 cg_symbols = set()         # тикеры мемкоинов из CoinGecko
 cg_last_refresh = 0.0
 cg_last_error = ""
+updates_received = 0      # сколько апдейтов дошло от Telegram
+last_update_at = 0.0
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -208,6 +211,34 @@ def norm_base(arg):
     """'btc', 'BTCUSDT', ' btc ' -> 'BTC'"""
     coin = (arg or "").strip().upper()
     return coin[:-4] if coin.endswith("USDT") and len(coin) > 4 else coin
+
+# ================= ДИАГНОСТИКА TELEGRAM =================
+# Сигналы уходят через sendMessage, а команды приходят через getUpdates —
+# это два независимых канала. Если бот сыплет сигналами, но молчит на команды,
+# значит getUpdates ничего не приносит. Логи ниже показывают это прямо.
+
+@dp.update.outer_middleware()
+async def log_incoming(handler, event, data):
+    global updates_received, last_update_at
+    updates_received += 1
+    last_update_at = time.time()
+
+    msg = getattr(event, "message", None)
+    if msg is not None and getattr(msg, "text", None):
+        who = getattr(getattr(msg, "from_user", None), "id", "?")
+        log("входящее от %s: %s" % (who, msg.text[:80]), "CMD")
+    else:
+        log("входящий апдейт #%d (%s)" % (updates_received, type(event).__name__), "CMD")
+    return await handler(event, data)
+
+
+@dp.errors()
+async def on_handler_error(event: types.ErrorEvent):
+    log("обработчик упал: %r" % event.exception, "ERR")
+    traceback.print_exception(type(event.exception), event.exception,
+                              event.exception.__traceback__)
+    return True
+
 
 # ================= TELEGRAM UI =================
 
@@ -785,6 +816,7 @@ async def status_cmd(message: types.Message):
         f"❗ Ошибка API: {info_last_error or 'нет'}\n"
         f"🛠 Ручной ЧС: {len(blacklist)} | Исключения: {len(allowlist)}\n"
         f"🧩 Версия: {version_line()}\n"
+        f"📨 Апдейтов от Telegram: {updates_received} (последний {_ago(last_update_at)})\n"
         f"💾 Хранилище: {storage.describe()}\n"
         f"📥 Прочитано из: {storage_source}\n"
         f"❗ Ошибка хранилища: {storage_error or 'нет'}"
@@ -1182,10 +1214,11 @@ async def parser_task():
                 await process_candidates(candidates, stats, now)
 
                 log("usdt=%d мемы=%d чс=%d неторг=%d объём_мал=%d битые=%d "
-                    "анализ=%d (из них с меткой ST %d) сигналы=%d"
+                    "анализ=%d (из них с меткой ST %d) сигналы=%d | апдейтов от TG %d"
                     % (stats["usdt"], stats["мемы"], stats["ручной_чс"],
                        stats["неторгуемые"], stats["объём_мал"], stats["битые"],
-                       stats["анализ"], stats["st_в_анализе"], stats["сигналы"]), "SCAN")
+                       stats["анализ"], stats["st_в_анализе"], stats["сигналы"],
+                       updates_received), "SCAN")
 
         except Exception as e:
             log("ошибка парсера: %r" % e, "ERR")
@@ -1217,9 +1250,43 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
     await site.start()
 
-    await bot.delete_webhook(drop_pending_updates=True)
+    # Вебхук блокирует getUpdates наглухо, поэтому снимаем и проверяем.
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        me = await bot.get_me()
+        log("бот @%s (id %s)" % (me.username, me.id))
+        hook = await bot.get_webhook_info()
+        if getattr(hook, "url", ""):
+            log("ВЕБХУК всё ещё стоит (%s) — getUpdates работать не будет" % hook.url, "ERR")
+    except TelegramUnauthorizedError:
+        log("ТОКЕН НЕВЕРНЫЙ ИЛИ ОТОЗВАН — бот не запустится", "ERR")
+        raise
+    except Exception as e:
+        log("не смог проверить бота: %r" % e, "ERR")
+
+    # Один пробный getUpdates: если тем же токеном опрашивает кто-то ещё,
+    # Telegram сразу ответит 409 Conflict — и это видно в логе, а не догадками.
+    try:
+        await bot.get_updates(offset=-1, timeout=0)
+        log("getUpdates доступен — команды будут приходить")
+    except TelegramConflictError as e:
+        log("КОНФЛИКТ getUpdates: тем же токеном опрашивает другой экземпляр бота. "
+            "Команды приходить НЕ БУДУТ, сигналы при этом идут. "
+            "Останови лишний сервис (старый Render, локальный запуск) "
+            "или заведи отдельный токен. Детали: %r" % e, "ERR")
+    except Exception as e:
+        log("пробный getUpdates не прошёл: %r" % e, "ERR")
     asyncio.create_task(parser_task())
-    await dp.start_polling(bot)
+
+    log("запускаю polling")
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        log("POLLING УПАЛ: %r — команды больше не приходят, выхожу, "
+            "чтобы Render перезапустил сервис" % e, "ERR")
+        traceback.print_exc()
+        raise
+    log("POLLING ЗАВЕРШИЛСЯ сам — команды больше не приходят", "ERR")
 
 if __name__ == "__main__":
     asyncio.run(main())
