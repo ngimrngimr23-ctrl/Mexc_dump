@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import re
+from urllib.parse import quote
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, CommandObject
@@ -33,7 +34,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8145739398:AAG3dl79hQnSsTe1KoYGt9hvaaUs
 # Версия кода. Видна в /start, /s и в логе при старте — чтобы сразу отвечать
 # на вопрос «какой код реально крутится на этом сервисе».
 # Поднимать вручную при заметных правках.
-CODE_VERSION = "2026-11-25 bl-button"
+CODE_VERSION = "2026-11-25 check-button"
 
 # Render сам подставляет эти переменные в окружение сервиса.
 RENDER_SERVICE = os.environ.get("RENDER_SERVICE_NAME", "")
@@ -211,16 +212,26 @@ def save_state():
 
 TICKER_RE = re.compile(r"^[A-Z0-9]{1,20}$")
 
+# Бот для проверки монеты. Кнопка «Проверка» открывает его со вписанным
+# тикером (ссылка t.me/<бот>?text=<тикер>). Пустое значение убирает кнопку.
+CHECK_BOT = os.environ.get("CHECK_BOT_USERNAME", "CryptoGulfHalal_Bot").strip().lstrip("@")
+
 
 def alert_keyboard(base, in_blacklist=False):
-    """Кнопка под сигналом. callback_data: 'bl:add:TICS' / 'bl:del:TICS'."""
+    """Кнопки под сигналом: проверка во внешнем боте и ЧС.
+    callback_data ЧС: 'bl:add:TICS' / 'bl:del:TICS'."""
+    rows = []
+    if CHECK_BOT:
+        rows.append([InlineKeyboardButton(
+            text="🔍 Проверка %s" % base,
+            url="https://t.me/%s?text=%s" % (CHECK_BOT, quote(base)))])
     if in_blacklist:
-        button = InlineKeyboardButton(text="✅ %s в ЧС · ↩️ вернуть" % base,
-                                      callback_data="bl:del:%s" % base)
+        rows.append([InlineKeyboardButton(text="✅ %s в ЧС · ↩️ вернуть" % base,
+                                          callback_data="bl:del:%s" % base)])
     else:
-        button = InlineKeyboardButton(text="🚫 Добавить %s в ЧС" % base,
-                                      callback_data="bl:add:%s" % base)
-    return InlineKeyboardMarkup(inline_keyboard=[[button]])
+        rows.append([InlineKeyboardButton(text="🚫 Добавить %s в ЧС" % base,
+                                          callback_data="bl:add:%s" % base)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def norm_base(arg):

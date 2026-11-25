@@ -394,13 +394,31 @@ async def test_incoming_diagnostics():
 
 
 # ------------------------------------------------- кнопка «в ЧС» под сигналом
+def bl_cb(markup):
+    """callback_data кнопки ЧС, где бы она ни стояла."""
+    return [b.callback_data for row in markup.inline_keyboard for b in row if b.callback_data][0]
+
+
+def check_url(markup):
+    urls = [b.url for row in markup.inline_keyboard for b in row if b.url]
+    return urls[0] if urls else None
+
+
 @check
 async def test_blacklist_button():
     reset()
     kb = main.alert_keyboard("TICS")
-    btn = kb.inline_keyboard[0][0]
-    assert btn.callback_data == "bl:add:TICS" and "TICS" in btn.text
-    assert len(main.alert_keyboard("A" * 20).inline_keyboard[0][0].callback_data.encode()) <= 64
+    assert bl_cb(kb) == "bl:add:TICS"
+    assert len(bl_cb(main.alert_keyboard("A" * 20)).encode()) <= 64
+
+    # кнопка «Проверка» открывает внешнего бота с вписанным тикером
+    assert check_url(kb) == "https://t.me/CryptoGulfHalal_Bot?text=TICS", check_url(kb)
+    assert check_url(main.alert_keyboard("TICS", in_blacklist=True)), \
+        "после нажатия ЧС кнопка проверки пропала"
+    saved = main.CHECK_BOT
+    main.CHECK_BOT = ""
+    assert check_url(main.alert_keyboard("TICS")) is None, "пустой CHECK_BOT должен убирать кнопку"
+    main.CHECK_BOT = saved
 
     # кнопка уходит только админу: в канале её могли бы нажать подписчики
     sent = []
@@ -415,7 +433,8 @@ async def test_blacklist_button():
     by_chat = dict(sent)
     assert by_chat[111] is not None, "у админа нет кнопки"
     assert by_chat["@chan"] is None, "кнопка попала в канал"
-    assert by_chat[111].inline_keyboard[0][0].callback_data == "bl:add:TICS"
+    assert bl_cb(by_chat[111]) == "bl:add:TICS"
+    assert check_url(by_chat[111]), "у админа нет кнопки проверки"
 
     class Chat:
         def __init__(self, cid): self.id = cid
@@ -432,7 +451,8 @@ async def test_blacklist_button():
     cb = CB("bl:add:TICS")
     await main.on_blacklist_button(cb)
     assert "TICS" in main.blacklist, "кнопка не добавила в ЧС"
-    assert cb.message.markup.inline_keyboard[0][0].callback_data == "bl:del:TICS"
+    assert bl_cb(cb.message.markup) == "bl:del:TICS"
+    assert check_url(cb.message.markup), "кнопка проверки пропала после нажатия ЧС"
     assert "добавлена" in cb.toast
     with open(STATE) as f:
         assert "TICS" in json.load(f)["blacklist"], "ЧС после кнопки не сохранился"
@@ -440,7 +460,7 @@ async def test_blacklist_button():
     cb = CB("bl:del:TICS")
     await main.on_blacklist_button(cb)
     assert "TICS" not in main.blacklist, "откат не сработал"
-    assert cb.message.markup.inline_keyboard[0][0].callback_data == "bl:add:TICS"
+    assert bl_cb(cb.message.markup) == "bl:add:TICS"
 
     # чужой чат (например, пересланное сообщение) ЧС не меняет
     cb = CB("bl:add:TICS", cid=999)
