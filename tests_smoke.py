@@ -528,6 +528,15 @@ async def test_halal_parse():
     doubtful = HARAM_REPLY.replace("غير مباح ❌", "مشبوه ⚠️")
     r = halal.parse_reply(doubtful, "MBL")
     assert r["status"] == halal.UNKNOWN and "مشبوه" in r["note"]
+    # реальный ответ бота на монету без решения
+    r = halal.parse_reply("لايوجد حكم لعملة QQQXYZ حتى الأن من الجهات المعنية", "QQQXYZ")
+    assert r["status"] == halal.UNKNOWN and r["note"] == "фатвы пока нет" and r.get("no_ruling"), r
+    assert halal.parse_reply("لا يوجد حكم لعملة ABC", "ABC")["note"] == "фатвы пока нет"
+    checker = halal.HalalChecker(main.log)
+    checker.cache["NR"] = dict(r, ts=time.time() - halal.TTL_UNKNOWN - 1)
+    assert checker.cached("NR"), "«фатвы нет» должно жить в кэше дольше обычного «не проверено»"
+    checker.cache["NR"]["ts"] = time.time() - halal.TTL_NO_RULING - 1
+    assert checker.cached("NR") is None
     r = halal.parse_reply("لم يتم العثور على العملة", "QQQ")
     assert r["status"] == halal.UNKNOWN and "нет вердикта" in r["note"]
     r = halal.parse_reply(HARAM_REPLY, "TICS")

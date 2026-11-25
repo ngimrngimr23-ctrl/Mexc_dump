@@ -31,6 +31,7 @@ HARD_TIMEOUT = 30          # потолок на весь запрос: доль
 MIN_INTERVAL = 1.5         # пауза между запросами, чтобы не спамить бота
 TTL_KNOWN = 7 * 24 * 3600  # вердикт может поменяться — бот сам об этом предупреждает
 TTL_UNKNOWN = 6 * 3600     # «не проверено» перепроверяем чаще
+TTL_NO_RULING = 24 * 3600  # «фатвы пока нет» — новые фатвы появляются нечасто
 
 HARAM, HALAL, UNKNOWN = "haram", "halal", "unknown"
 
@@ -40,6 +41,8 @@ _COIN_KEYS = ("أسم العملة", "اسم العملة", "إسم العملة
 _RULING_KEY = "حكم العملة"
 _LINK_KEY = "رابط الحكم"
 _SOURCE_KEY = "مصدر الحكم"
+# «لايوجد حكم لعملة X حتى الأن» — по монете пока нет решения
+_NO_RULING = re.compile(r"لا\s*يوجد\s*حكم")
 
 
 def _clean(text):
@@ -69,7 +72,9 @@ def parse_reply(text, ticker):
         "note": "",
     }
 
-    if not ruling:
+    if not ruling and _NO_RULING.search(_clean(text)):
+        result.update(status=UNKNOWN, note="фатвы пока нет", no_ruling=True)
+    elif not ruling:
         snippet = re.sub(r"\s+", " ", _clean(text)).strip()[:120]
         result.update(status=UNKNOWN, note="в ответе нет вердикта: «%s»" % snippet)
     elif coin and coin.strip().upper() != ticker.upper():
@@ -158,7 +163,12 @@ class HalalChecker:
         entry = self.cache.get(ticker)
         if not entry:
             return None
-        ttl = TTL_UNKNOWN if entry["status"] == UNKNOWN else TTL_KNOWN
+        if entry.get("no_ruling"):
+            ttl = TTL_NO_RULING
+        elif entry["status"] == UNKNOWN:
+            ttl = TTL_UNKNOWN
+        else:
+            ttl = TTL_KNOWN
         return entry if time.time() - entry.get("ts", 0) < ttl else None
 
     def forget(self, ticker):
