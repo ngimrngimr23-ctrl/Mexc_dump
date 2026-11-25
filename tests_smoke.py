@@ -71,6 +71,7 @@ def reset():
     main.halal_checker.cache.clear()
     main.halal_checker.client = None
     main.settings["halal_check"] = True
+    main.settings["halal_only"] = False
     main.get_long_term_changes = REAL_KLINES
     if os.path.exists(STATE):
         os.remove(STATE)
@@ -756,6 +757,81 @@ async def test_halal_state_persists():
     assert main.halal_ignore == {"MBL"}
     assert main.halal_checker.cached("XYZ")["status"] == halal.HARAM
     assert main.settings["halal_check"] is False
+
+@check
+async def test_halal_only_mode():
+    reset()
+    async def zero(sym, cur): return 0.0, 0.0, 0.0
+    main.get_long_term_changes = zero
+
+    class Msg:
+        async def answer(self, text, **k): self.t = text
+    class Cmd:
+        def __init__(self, a): self.args = a
+
+    real = main.halal_checker
+    main.halal_checker = StubChecker({
+        "MBL": {"status": halal.HARAM, "link": "x"},
+        "GOOD": {"status": halal.HALAL},
+        "NORUL": {"status": halal.UNKNOWN, "note": "фатвы пока нет", "no_ruling": True},
+    })
+    try:
+        m = Msg(); await main.halal_cmd(m, Cmd("only"))
+        assert main.settings["halal_only"] and main.settings["halal_check"]
+        assert "Только халяль" in m.t
+        assert main.halal_mode() == "ТОЛЬКО ХАЛЯЛЬ"
+
+        SENT.clear()
+        stats = Counter()
+        await main.process_candidates(
+            [cand("MBLUSDT"), cand("GOODUSDT"), cand("NORULUSDT"), cand("ODDUSDT")],
+            stats, time.time())
+        coins = [t.split("<code>")[1].split("</code>")[0] for t in SENT]
+        assert coins == ["GOOD"], "в режиме «только халяль» пришло лишнее: %s" % coins
+        assert stats["харам"] == 1 and stats["не_халяль"] == 2, stats
+        assert "MBL" in main.blacklist, "харам по-прежнему уходит в ЧС"
+        assert "NORUL" not in main.blacklist and "ODD" not in main.blacklist, \
+            "неизвестные не должны попадать в ЧС — фатва может появиться позже"
+
+        # ручной возврат из ЧС уважается и в строгом режиме
+        main.halal_ignore.add("MANUAL")
+        main.daily_memory.clear(); SENT.clear()
+        await main.process_candidates([cand("MANUALUSDT")], Counter(), time.time())
+        assert len(SENT) == 1 and "вручную" in SENT[0]
+
+        # обычный режим: непроверенные снова приходят с пометкой
+        m = Msg(); await main.halal_cmd(m, Cmd("all"))
+        assert not main.settings["halal_only"] and main.settings["halal_check"]
+        main.daily_memory.clear(); SENT.clear()
+        await main.process_candidates([cand("NORULUSDT")], Counter(), time.time())
+        assert len(SENT) == 1 and "фатвы пока нет" in SENT[0]
+
+        # /halal off выключает и строгий режим, иначе он отсеял бы всё
+        await main.halal_cmd(Msg(), Cmd("only"))
+        await main.halal_cmd(Msg(), Cmd("off"))
+        assert not main.settings["halal_check"] and not main.settings["halal_only"]
+    finally:
+        main.halal_checker = real
+
+    # строгий режим без ключей юзербота: ничего не шлём и пишем об этом
+    reset()
+    main.get_long_term_changes = zero
+    main.settings["halal_only"] = True
+    SENT.clear()
+    stats = Counter()
+    await main.process_candidates([cand("ODDUSDT")], stats, time.time())
+    assert not SENT and stats["не_халяль"] == 1
+
+    # предупреждение, если включают строгий режим без подключённого юзербота
+    m = Msg(); await main.halal_cmd(m, Cmd("only"))
+    assert "не подключён" in m.t
+
+    # режим сохраняется и попадает в строку /set
+    main.save_state()
+    main.settings["halal_only"] = False
+    await main.load_state()
+    assert main.settings["halal_only"] is True
+    assert "halalonly=on" in main.config_line()
 
 async def main_run():
     failed = []

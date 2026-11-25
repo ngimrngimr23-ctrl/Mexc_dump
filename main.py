@@ -36,7 +36,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8145739398:AAG3dl79hQnSsTe1KoYGt9hvaaUs
 # Версия кода. Видна в /start, /s и в логе при старте — чтобы сразу отвечать
 # на вопрос «какой код реально крутится на этом сервисе».
 # Поднимать вручную при заметных правках.
-CODE_VERSION = "2026-11-25 halal-visible"
+CODE_VERSION = "2026-11-25 halal-only"
 
 # Render сам подставляет эти переменные в окружение сервиса.
 RENDER_SERVICE = os.environ.get("RENDER_SERVICE_NAME", "")
@@ -67,6 +67,7 @@ settings = {
     "info_refresh_min": 60,  # Как часто обновлять exchangeInfo (мин)
     "use_coingecko": True,   # Брать мемкоины ещё и из категории meme-token
     "halal_check": True,     # Проверять монету в халяль-боте перед сигналом (если юзербот настроен)
+    "halal_only": False,     # Пропускать только подтверждённые халяль, неизвестные тоже отсеивать
     "cg_refresh_hours": 24   # Как часто обновлять список CoinGecko
 }
 
@@ -169,8 +170,9 @@ async def load_state():
     for key in ("day3_min_drop", "day3_drop"):
         if key in data:
             settings[key] = float(data[key])
-    if "halal_check" in data:
-        settings["halal_check"] = bool(data["halal_check"])
+    for key in ("halal_check", "halal_only"):
+        if key in data:
+            settings[key] = bool(data[key])
     halal_ignore.update(str(x).upper() for x in data.get("halal_ignore", []))
     halal_checker.import_cache(data.get("halal_cache"))
     log("состояние загружено из «%s»: ЧС=%d, allowlist=%d, skip_memes=%s"
@@ -195,6 +197,7 @@ def _state_payload():
         "cg_symbols": sorted(cg_symbols),
         "cg_last_refresh": cg_last_refresh,
         "halal_check": settings["halal_check"],
+        "halal_only": settings["halal_only"],
         "halal_ignore": sorted(halal_ignore),
         "halal_cache": halal_checker.export_cache(),
     }
@@ -251,6 +254,12 @@ def alert_keyboard(base, in_blacklist=False):
         rows.append([InlineKeyboardButton(text="🚫 Добавить %s в ЧС" % base,
                                           callback_data="bl:add:%s" % base)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def halal_mode():
+    if not settings["halal_check"]:
+        return "выкл"
+    return "ТОЛЬКО ХАЛЯЛЬ" if settings["halal_only"] else "ВКЛ (блок харам)"
 
 
 def note_manual_unblacklist(base):
@@ -354,6 +363,7 @@ async def start_cmd(message: types.Message):
         f"🗓 Фильтр макс 30д: <b>{fmt_max(settings['month_drop'])}</b>\n"
         f"💰 Мин. объём: <b>{settings['min_volume']:,}$</b>\n"
         f"🎭 Мем-фильтр: <b>{'ВКЛ' if settings['skip_memes'] else 'выкл'}</b> (мемов в базе: {len(meme_pairs)})\n"
+        f"🕌 Халяль: <b>{halal_mode()}</b>\n"
         f"📢 Канал: <b>{settings['channel_id'] or 'Не задан'}</b>\n\n"
         "⚙️ <b>Команды:</b>\n"
         "/p 5 — % падения в окне\n"
@@ -375,6 +385,7 @@ async def start_cmd(message: types.Message):
         "/plates — категории монет по данным MEXC\n"
         "/cg on|off|refresh — второй источник мемов (CoinGecko)\n"
         "/halal on|off|MBL — автопроверка халяльности перед сигналом\n"
+        "/halal only — только халяль (неизвестные тоже отсеять), /halal all — обычный\n"
         "/why DOGE — почему монета проходит/не проходит\n"
         "/channel @имя_канала — куда дублировать сигналы (пусто = выкл)\n"
         "/set p=5 t=5 — менять несколько настроек разом\n"
@@ -557,6 +568,7 @@ SET_SPEC = (
     ("memes",   "skip_memes",     "bool"),
     ("cg",      "use_coingecko",  "bool"),
     ("halal",   "halal_check",    "bool"),
+    ("halalonly", "halal_only",   "bool"),
     ("channel", "channel_id",     "text"),
 )
 SET_BY_KEY = {k: (field, kind) for k, field, kind in SET_SPEC}
@@ -780,8 +792,30 @@ async def halal_cmd(message: types.Message, command: CommandObject):
         settings["halal_check"] = True
         save_state()
     elif low in ("off", "выкл", "0"):
+        # Без проверки режим «только халяль» отсеял бы вообще всё.
         settings["halal_check"] = False
+        settings["halal_only"] = False
         save_state()
+    elif low in ("only", "только"):
+        settings["halal_check"] = True
+        settings["halal_only"] = True
+        save_state()
+        log("режим «только халяль» включён", "CMD")
+        warn = "" if halal_checker.ready else (
+            "\n\n⚠️ Юзербот сейчас не подключён — пока это так, сигналов не будет вообще: "
+            + html.escape(halal_checker.describe()))
+        return await message.answer(
+            "✅ <b>Только халяль</b>: сигналы приходят лишь по монетам с вердиктом "
+            "مباح. Харам уходит в ЧС, «фатвы нет» и любые непроверенные молча "
+            "отсеиваются.\nВернуть обычный режим: /halal all" + warn,
+            parse_mode="HTML")
+    elif low in ("all", "все", "всё"):
+        settings["halal_only"] = False
+        save_state()
+        log("режим «только халяль» выключен", "CMD")
+        return await message.answer(
+            "✅ Обычный режим: харам блокируется, непроверенные приходят с пометкой.",
+            parse_mode="HTML")
     elif arg:
         # Ручная проверка — удобно убедиться, что связка с ботом работает.
         base = norm_base(arg)
@@ -805,12 +839,13 @@ async def halal_cmd(message: types.Message, command: CommandObject):
             + (f"📚 {html.escape(v['source'])}" if v.get("source") else ""),
             parse_mode="HTML", disable_web_page_preview=True)
 
-    on = settings["halal_check"]
     await message.answer(
-        f"🕌 <b>Халяль-проверка</b>: {'ВКЛ' if on else 'выкл'}\n"
+        f"🕌 <b>Халяль-проверка</b>: {halal_mode()}\n"
         f"Юзербот: {html.escape(halal_checker.describe())}\n"
         f"Возвращены вручную: {', '.join(sorted(halal_ignore)) or 'нет'}\n\n"
-        "/halal on | /halal off — включить/выключить\n"
+        "/halal only — только халяль, неизвестные тоже отсеивать\n"
+        "/halal all — обычный режим (блок только харам)\n"
+        "/halal on | /halal off — включить/выключить проверку\n"
         "/halal MBL — проверить монету прямо сейчас",
         parse_mode="HTML")
 
@@ -956,7 +991,7 @@ async def status_cmd(message: types.Message):
         f"🛑 В памяти дампов: {len(daily_memory)}\n\n"
         f"🎭 Мем-фильтр: {'ВКЛ' if settings['skip_memes'] else 'выкл'}\n"
         f"🚫 Мемов найдено: {len(meme_pairs)}\n"
-        f"🕌 Халяль-проверка: {'ВКЛ' if settings['halal_check'] else 'выкл'}, "
+        f"🕌 Халяль-проверка: {halal_mode()}, "
         f"{html.escape(halal_checker.describe())}\n"
         f"🦎 CoinGecko: {'ВКЛ' if settings['use_coingecko'] else 'выкл'}, "
         f"тикеров {len(cg_symbols)}, {_ago(cg_last_refresh)}\n"
@@ -1203,9 +1238,21 @@ async def process_candidates(candidates, stats, now):
                     continue
                 if verdict["status"] == halal.HALAL:
                     halal_line = "🕌 Халяль: <b>مباح ✅</b>\n"
+                elif settings["halal_only"]:
+                    # Режим «только халяль»: неподтверждённые не шлём, но и в ЧС
+                    # не кладём — фатва может появиться позже.
+                    stats["не_халяль"] += 1
+                    log("пропущен %s: не подтверждён как халяль (%s)"
+                        % (base_coin, verdict.get("note") or "нет ответа"), "HALAL")
+                    continue
                 else:
                     halal_line = "🕌 Халяль: не проверено (%s)\n" % html.escape(
                         verdict.get("note") or "нет ответа")
+        elif settings["halal_check"] and settings["halal_only"]:
+            stats["не_халяль"] += 1
+            log("пропущен %s: режим «только халяль», а проверка на этом сервисе "
+                "не настроена (нет TG_SESSION)" % base_coin, "WARN")
+            continue
         elif settings["halal_check"]:
             # Проверка включена, но на этом сервисе нет ключей юзербота. Молча
             # пропускать нельзя: так сигнал без проверки неотличим от проверенного.
@@ -1390,11 +1437,12 @@ async def parser_task():
                 await process_candidates(candidates, stats, now)
 
                 log("usdt=%d мемы=%d чс=%d неторг=%d объём_мал=%d битые=%d "
-                    "анализ=%d (из них с меткой ST %d) сигналы=%d харам=%d | апдейтов от TG %d"
+                    "анализ=%d (из них с меткой ST %d) сигналы=%d харам=%d не_халяль=%d "
+                    "| апдейтов от TG %d"
                     % (stats["usdt"], stats["мемы"], stats["ручной_чс"],
                        stats["неторгуемые"], stats["объём_мал"], stats["битые"],
                        stats["анализ"], stats["st_в_анализе"], stats["сигналы"],
-                       stats["харам"], updates_received), "SCAN")
+                       stats["харам"], stats["не_халяль"], updates_received), "SCAN")
 
         except Exception as e:
             log("ошибка парсера: %r" % e, "ERR")
