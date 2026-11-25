@@ -22,6 +22,7 @@ for var in ("CHAT_ID", "CHANNEL_ID", "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_RE
 sys.path.insert(0, HERE)
 
 import coingecko
+import halal
 import main
 import storage
 from memecoins import classify
@@ -66,6 +67,10 @@ def reset():
                           "percent": 5.0, "hour_percent": 15.0,
                           "window_min": 5, "min_volume": 100000})
     main.cg_last_refresh = 0.0
+    main.halal_ignore.clear()
+    main.halal_checker.cache.clear()
+    main.halal_checker.client = None
+    main.settings["halal_check"] = True
     main.get_long_term_changes = REAL_KLINES
     if os.path.exists(STATE):
         os.remove(STATE)
@@ -494,6 +499,194 @@ async def test_blacklist_button():
     await main.on_blacklist_button(cb)
     assert "OLD" in main.blacklist
 
+
+# ------------------------------------------------- халяль-проверка
+# Ответ бота ровно в том виде, в каком его прислали (с двойными пробелами).
+HARAM_REPLY = """أسم العملة: MBL
+حكم العملة:  غير مباح ❌
+رابط الحكم:  https://t.me/CrypoIslam/322
+مصدر الحكم: كريبتو اسلام
+تحذير: يرجى التحقق من الرابط، قد يكون تغير الحكم"""
+
+
+@check
+async def test_halal_parse():
+    r = halal.parse_reply(HARAM_REPLY, "MBL")
+    assert r["status"] == halal.HARAM, r
+    assert r["link"] == "https://t.me/CrypoIslam/322" and r["coin"] == "MBL"
+    assert r["source"] == "كريبتو اسلام"
+    assert halal.parse_reply(HARAM_REPLY, "mbl")["status"] == halal.HARAM
+
+    # невидимые символы направления текста не должны ломать разбор
+    rtl = HARAM_REPLY.replace("غير", "‏غير‎").replace("حكم", "‫حكم")
+    assert halal.parse_reply(rtl, "MBL")["status"] == halal.HARAM
+
+    ok = HARAM_REPLY.replace("غير مباح ❌", "مباح ✅")
+    assert halal.parse_reply(ok, "MBL")["status"] == halal.HALAL
+
+    # всё непонятное — «не проверено», а не харам
+    doubtful = HARAM_REPLY.replace("غير مباح ❌", "مشبوه ⚠️")
+    r = halal.parse_reply(doubtful, "MBL")
+    assert r["status"] == halal.UNKNOWN and "مشبوه" in r["note"]
+    r = halal.parse_reply("لم يتم العثور على العملة", "QQQ")
+    assert r["status"] == halal.UNKNOWN and "нет вердикта" in r["note"]
+    r = halal.parse_reply(HARAM_REPLY, "TICS")
+    assert r["status"] == halal.UNKNOWN and "другую монету" in r["note"], \
+        "ответ про чужую монету не должен блокировать нашу"
+
+
+class FakeConv:
+    def __init__(self, replies):
+        self.replies, self.sent = list(replies), []
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+    async def send_message(self, text): self.sent.append(text)
+    async def get_response(self, timeout=None):
+        if not self.replies:
+            raise asyncio.TimeoutError()
+        item = self.replies.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return types.SimpleNamespace(raw_text=item)
+
+
+class FakeClient:
+    def __init__(self, script):
+        self.script, self.asked = script, []
+    def conversation(self, bot, **kw):
+        conv = FakeConv(self.script.get(len(self.asked), []))
+        self.asked.append(bot)
+        return conv
+
+
+@check
+async def test_halal_checker():
+    checker = halal.HalalChecker(main.log)
+    saved = halal.MIN_INTERVAL
+    halal.MIN_INTERVAL = 0
+    try:
+        # сначала «ищу…», вердикт следующим сообщением
+        checker.client = FakeClient({0: ["🔎 جاري البحث...", HARAM_REPLY]})
+        v = await checker.check("MBL")
+        assert v["status"] == halal.HARAM, v
+        assert checker.client.asked == [halal.BOT]
+
+        # повторный запрос берётся из кэша, бот не дёргается
+        v = await checker.check("mbl")
+        assert v["status"] == halal.HARAM and len(checker.client.asked) == 1
+
+        # бот молчит — «не проверено», без исключения
+        checker.client = FakeClient({0: []})
+        v = await checker.check("SILENT")
+        assert v["status"] == halal.UNKNOWN and "не ответил" in v["note"]
+
+        # обрыв связи — тоже без исключения
+        checker.client = FakeClient({0: [ConnectionError("нет сети")]})
+        v = await checker.check("BROKEN")
+        assert v["status"] == halal.UNKNOWN and "ошибка" in v["note"]
+
+        # «не проверено» живёт в кэше меньше, чем вердикт
+        checker.cache["OLDU"] = {"status": halal.UNKNOWN, "ts": time.time() - halal.TTL_UNKNOWN - 1}
+        checker.cache["OLDH"] = {"status": halal.HARAM, "ts": time.time() - halal.TTL_UNKNOWN - 1}
+        assert checker.cached("OLDU") is None and checker.cached("OLDH")
+
+        # без клиента — честное «не подключён»
+        checker.client = None
+        v = await checker.check("NOPE")
+        assert v["status"] == halal.UNKNOWN and "не подключён" in v["note"]
+    finally:
+        halal.MIN_INTERVAL = saved
+
+
+class StubChecker:
+    def __init__(self, verdicts): self.verdicts, self.asked = verdicts, []
+    @staticmethod
+    def is_configured(): return True
+    ready = True
+    cache = {}
+    def cached(self, t):
+        v = self.verdicts.get(t.upper())
+        return dict(v, ts=time.time()) if v else None
+    async def check(self, t, fresh=False):
+        self.asked.append(t)
+        return self.verdicts.get(t, {"status": halal.UNKNOWN, "note": "бот <молчит> & всё"})
+    def export_cache(self): return {}
+    def import_cache(self, d): pass
+    def describe(self): return "заглушка"
+
+
+@check
+async def test_halal_blocks_alerts():
+    reset()
+    async def zero(sym, cur): return 0.0, 0.0, 0.0
+    main.get_long_term_changes = zero
+    real = main.halal_checker
+    main.halal_checker = StubChecker({
+        "MBL": {"status": halal.HARAM, "link": "https://t.me/CrypoIslam/322"},
+        "GOOD": {"status": halal.HALAL},
+    })
+    try:
+        SENT.clear()
+        stats = Counter()
+        await main.process_candidates(
+            [cand("MBLUSDT"), cand("GOODUSDT"), cand("ODDUSDT")], stats, time.time())
+        assert "MBL" in main.blacklist, "харам-монета не попала в ЧС"
+        assert stats["харам"] == 1
+        texts = "\n".join(SENT)
+        assert "ДАМП: <code>MBL</code>" not in texts, "по харам-монете пришёл сигнал"
+        good = [t for t in SENT if "<code>GOOD</code>" in t][0]
+        assert "Халяль: <b>مباح ✅</b>" in good
+        odd = [t for t in SENT if "<code>ODD</code>" in t][0]
+        assert "не проверено" in odd, "непонятный ответ должен пропускать сигнал с пометкой"
+        assert "&lt;молчит&gt; &amp;" in odd, "текст ответа не экранирован для HTML"
+        with open(STATE) as f:
+            assert "MBL" in json.load(f)["blacklist"]
+
+        # ты вернул MBL из ЧС — проверка больше не должна её блокировать
+        class Msg:
+            async def answer(self, text, **k): self.t = text
+        class Cmd:
+            def __init__(self, a): self.args = a
+        await main.del_blacklist(Msg(), Cmd("MBL"))
+        assert "MBL" not in main.blacklist and "MBL" in main.halal_ignore
+        main.daily_memory.clear(); SENT.clear()
+        await main.process_candidates([cand("MBLUSDT")], Counter(), time.time())
+        assert len(SENT) == 1 and "не проверяется" in SENT[0], SENT
+        assert "MBL" not in main.blacklist
+
+        # а /b снова отдаёт монету под проверку
+        await main.add_blacklist(Msg(), Cmd("MBL"))
+        assert "MBL" not in main.halal_ignore
+
+        # выключили проверку — сигналы без вопросов к боту
+        main.settings["halal_check"] = False
+        main.halal_checker.asked.clear(); main.daily_memory.clear(); SENT.clear()
+        await main.process_candidates([cand("ODDUSDT")], Counter(), time.time())
+        assert len(SENT) == 1 and not main.halal_checker.asked and "Халяль" not in SENT[0]
+    finally:
+        main.halal_checker = real
+
+    # без настроек юзербота сигналы идут как раньше
+    reset()
+    main.get_long_term_changes = zero
+    SENT.clear()
+    await main.process_candidates([cand("ODDUSDT")], Counter(), time.time())
+    assert len(SENT) == 1 and "Халяль" not in SENT[0]
+
+
+@check
+async def test_halal_state_persists():
+    reset()
+    main.halal_ignore.add("MBL")
+    main.halal_checker.cache["XYZ"] = {"status": halal.HARAM, "ts": time.time()}
+    main.settings["halal_check"] = False
+    main.save_state()
+    main.halal_ignore.clear(); main.halal_checker.cache.clear()
+    main.settings["halal_check"] = True
+    await main.load_state()
+    assert main.halal_ignore == {"MBL"}
+    assert main.halal_checker.cached("XYZ")["status"] == halal.HARAM
+    assert main.settings["halal_check"] is False
 
 async def main_run():
     failed = []
