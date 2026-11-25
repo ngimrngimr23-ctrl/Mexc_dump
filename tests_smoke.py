@@ -535,53 +535,105 @@ async def test_halal_parse():
         "ответ про чужую монету не должен блокировать нашу"
 
 
-class FakeConv:
-    def __init__(self, replies):
-        self.replies, self.sent = list(replies), []
-    async def __aenter__(self): return self
-    async def __aexit__(self, *a): return False
-    async def send_message(self, text): self.sent.append(text)
-    async def get_response(self, timeout=None):
-        if not self.replies:
-            raise asyncio.TimeoutError()
-        item = self.replies.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        return types.SimpleNamespace(raw_text=item)
+class PollClient:
+    """Заглушка Telethon: send_message отдаёт id, get_messages — текущее
+    состояние переписки на каждом опросе (так видны и правки сообщений)."""
+    def __init__(self, timeline=None, send_exc=None, send_delay=0):
+        self.timeline, self.send_exc, self.send_delay = list(timeline or []), send_exc, send_delay
+        self.sent, self.polls = [], 0
+    async def send_message(self, bot, text):
+        if self.send_delay:
+            await asyncio.sleep(self.send_delay)
+        if self.send_exc:
+            raise self.send_exc
+        self.sent.append((bot, text))
+        return types.SimpleNamespace(id=100)
+    async def get_messages(self, bot, limit=5, min_id=0):
+        self.polls += 1
+        if not self.timeline:
+            return []
+        state = self.timeline[min(self.polls - 1, len(self.timeline) - 1)]
+        return [types.SimpleNamespace(id=i, out=out, raw_text=t)
+                for i, t, out in [(x + (False,))[:3] for x in state] if i > min_id]
 
 
-class FakeClient:
-    def __init__(self, script):
-        self.script, self.asked = script, []
-    def conversation(self, bot, **kw):
-        conv = FakeConv(self.script.get(len(self.asked), []))
-        self.asked.append(bot)
-        return conv
+class FloodWaitError(Exception):
+    def __init__(self, seconds): self.seconds = seconds
 
 
 @check
 async def test_halal_checker():
-    checker = halal.HalalChecker(main.log)
-    saved = halal.MIN_INTERVAL
-    halal.MIN_INTERVAL = 0
+    saved = (halal.MIN_INTERVAL, halal.POLL_INTERVAL, halal.REPLY_TIMEOUT, halal.HARD_TIMEOUT)
+    halal.MIN_INTERVAL, halal.POLL_INTERVAL, halal.REPLY_TIMEOUT, halal.HARD_TIMEOUT = 0, 0, 0.2, 2
     try:
-        # сначала «ищу…», вердикт следующим сообщением
-        checker.client = FakeClient({0: ["🔎 جاري البحث...", HARAM_REPLY]})
+        checker = halal.HalalChecker(main.log)
+
+        # вердикт сразу
+        checker.client = PollClient([[(101, HARAM_REPLY)]])
         v = await checker.check("MBL")
         assert v["status"] == halal.HARAM, v
-        assert checker.client.asked == [halal.BOT]
+        assert checker.client.sent == [(halal.BOT, "MBL")]
 
-        # повторный запрос берётся из кэша, бот не дёргается
+        # из кэша — бот не дёргается
         v = await checker.check("mbl")
-        assert v["status"] == halal.HARAM and len(checker.client.asked) == 1
+        assert v["status"] == halal.HARAM and len(checker.client.sent) == 1
 
-        # бот молчит — «не проверено», без исключения
-        checker.client = FakeClient({0: []})
+        # «ищу…», потом то же сообщение отредактировано в вердикт
+        checker.client = PollClient([[(101, "🔎 جاري البحث...")],
+                                     [(101, "🔎 جاري البحث...")],
+                                     [(101, HARAM_REPLY.replace("MBL", "EDIT"))]])
+        v = await checker.check("EDIT")
+        assert v["status"] == halal.HARAM, "правка сообщения не увидена: %r" % v
+        assert checker.client.polls >= 3
+
+        # запоздалый ответ на прошлый вопрос не принимается за наш
+        other = HARAM_REPLY.replace("MBL", "TICS")
+        mine = HARAM_REPLY.replace("MBL", "NEWC").replace("غير مباح ❌", "مباح ✅")
+        checker.client = PollClient([[(101, other)], [(101, other), (102, mine)]])
+        v = await checker.check("NEWC")
+        assert v["status"] == halal.HALAL and v["coin"] == "NEWC", v
+
+        # своё исходящее сообщение игнорируется
+        checker.client = PollClient([[(101, "QUIETX", True)]])
+        v = await checker.check("QUIETX")
+        assert v["status"] == halal.UNKNOWN and "не ответил" in v["note"], v
+
+        # бот ответил, но без вердикта — «не проверено» с текстом ответа
+        checker.client = PollClient([[(101, "لم يتم العثور على العملة")]])
+        v = await checker.check("QQQXYZ")
+        assert v["status"] == halal.UNKNOWN and "لم يتم" in v["note"], v
+
+        # тишина
+        checker.client = PollClient([])
         v = await checker.check("SILENT")
         assert v["status"] == halal.UNKNOWN and "не ответил" in v["note"]
 
-        # обрыв связи — тоже без исключения
-        checker.client = FakeClient({0: [ConnectionError("нет сети")]})
+        # FloodWait: сразу выходим и дальше не спрашиваем до конца паузы
+        checker.client = PollClient(send_exc=FloodWaitError(30))
+        v = await checker.check("FLOOD")
+        assert v["status"] == halal.UNKNOWN and "подождать 30" in v["note"], v
+        assert 25 <= checker.cooldown_left() <= 30
+        checker.client = PollClient([[(101, HARAM_REPLY.replace("MBL", "LATER"))]])
+        v = await checker.check("LATER")
+        assert v["status"] == halal.UNKNOWN and not checker.client.sent, \
+            "во время паузы бота дёргать нельзя"
+        keys = (halal.API_ID, halal.API_HASH, halal.SESSION)
+        halal.API_ID, halal.API_HASH, halal.SESSION = "1", "h", "s"
+        assert "подождать" in checker.describe(), checker.describe()
+        halal.API_ID, halal.API_HASH, halal.SESSION = keys
+        checker.cooldown_until = 0
+
+        # зависший запрос обрывается жёстким таймаутом и не держит очередь
+        halal.HARD_TIMEOUT = 0.3
+        checker.client = PollClient(send_delay=5)
+        started = time.time()
+        v = await checker.check("HANG")
+        assert v["status"] == halal.UNKNOWN and "завис" in v["note"], v
+        assert time.time() - started < 2 and not checker.busy
+        halal.HARD_TIMEOUT = 2
+
+        # обрыв связи — без исключения
+        checker.client = PollClient(send_exc=ConnectionError("нет сети"))
         v = await checker.check("BROKEN")
         assert v["status"] == halal.UNKNOWN and "ошибка" in v["note"]
 
@@ -590,12 +642,11 @@ async def test_halal_checker():
         checker.cache["OLDH"] = {"status": halal.HARAM, "ts": time.time() - halal.TTL_UNKNOWN - 1}
         assert checker.cached("OLDU") is None and checker.cached("OLDH")
 
-        # без клиента — честное «не подключён»
         checker.client = None
         v = await checker.check("NOPE")
         assert v["status"] == halal.UNKNOWN and "не подключён" in v["note"]
     finally:
-        halal.MIN_INTERVAL = saved
+        halal.MIN_INTERVAL, halal.POLL_INTERVAL, halal.REPLY_TIMEOUT, halal.HARD_TIMEOUT = saved
 
 
 class StubChecker:

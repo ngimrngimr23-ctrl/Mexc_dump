@@ -25,9 +25,9 @@ API_HASH = os.environ.get("TG_API_HASH", "").strip()
 SESSION = os.environ.get("TG_SESSION", "").strip()
 BOT = os.environ.get("HALAL_BOT", "CryptoGulfHalal_Bot").strip().lstrip("@")
 
-FIRST_REPLY_TIMEOUT = 12   # сколько ждём первый ответ бота
-NEXT_REPLY_TIMEOUT = 4     # бот может прислать «ищу…», а вердикт следом
-MAX_MESSAGES = 3
+REPLY_TIMEOUT = 15         # сколько ждём вердикт после отправки тикера
+POLL_INTERVAL = 1.0        # как часто перечитываем ответы бота
+HARD_TIMEOUT = 30          # потолок на весь запрос: дольше проверка висеть не может
 MIN_INTERVAL = 1.5         # пауза между запросами, чтобы не спамить бота
 TTL_KNOWN = 7 * 24 * 3600  # вердикт может поменяться — бот сам об этом предупреждает
 TTL_UNKNOWN = 6 * 3600     # «не проверено» перепроверяем чаще
@@ -73,7 +73,8 @@ def parse_reply(text, ticker):
         snippet = re.sub(r"\s+", " ", _clean(text)).strip()[:120]
         result.update(status=UNKNOWN, note="в ответе нет вердикта: «%s»" % snippet)
     elif coin and coin.strip().upper() != ticker.upper():
-        result.update(status=UNKNOWN, note="ответ про другую монету (%s)" % coin)
+        result.update(status=UNKNOWN, note="ответ про другую монету (%s)" % coin,
+                      mismatch=True)
     elif "غير مباح" in ruling:
         result["status"] = HARAM
     elif "مباح" in ruling:
@@ -81,6 +82,10 @@ def parse_reply(text, ticker):
     else:
         result.update(status=UNKNOWN, note="непонятный вердикт: %s" % ruling)
     return result
+
+
+def _unknown(note):
+    return {"status": UNKNOWN, "note": note, "ruling": "", "link": "", "source": "", "coin": ""}
 
 
 class HalalChecker:
@@ -92,6 +97,7 @@ class HalalChecker:
         self.last_error = ""
         self.last_query = 0.0
         self.queries = 0
+        self.cooldown_until = 0.0  # Telegram попросил аккаунт подождать
         self._lock = asyncio.Lock()
 
     @staticmethod
@@ -102,12 +108,21 @@ class HalalChecker:
     def ready(self):
         return self.client is not None
 
+    @property
+    def busy(self):
+        return self._lock.locked()
+
+    def cooldown_left(self):
+        return max(0, int(self.cooldown_until - time.time()))
+
     def describe(self):
         if not self.is_configured():
             return "не настроена (нет TG_API_ID / TG_API_HASH / TG_SESSION)"
         if not self.ready:
             return "не подключена: %s" % (self.last_error or "ещё не запускалась")
-        return "через %s → @%s, в кэше %d" % (self.me, BOT, len(self.cache))
+        pause = " — Telegram просит подождать ещё %d с" % self.cooldown_left() \
+            if self.cooldown_left() else ""
+        return "через %s → @%s, в кэше %d%s" % (self.me, BOT, len(self.cache), pause)
 
     async def start(self):
         if not self.is_configured():
@@ -118,7 +133,10 @@ class HalalChecker:
             from telethon import TelegramClient
             from telethon.sessions import StringSession
 
-            client = TelegramClient(StringSession(SESSION), int(API_ID), API_HASH)
+            # flood_sleep_threshold=0: на FloodWait сразу получаем ошибку, а не
+            # молчаливый сон до минуты, во время которого висят команды и сигналы.
+            client = TelegramClient(StringSession(SESSION), int(API_ID), API_HASH,
+                                    flood_sleep_threshold=0)
             await client.connect()
             if not await client.is_user_authorized():
                 self.last_error = "строка сессии недействительна — получи новую"
@@ -154,8 +172,9 @@ class HalalChecker:
             if hit:
                 return hit
         if not self.ready:
-            return {"status": UNKNOWN, "note": "юзербот не подключён", "ruling": "",
-                    "link": "", "source": "", "coin": ""}
+            return _unknown("юзербот не подключён")
+        if self.cooldown_left():
+            return _unknown("Telegram просит подождать ещё %d с" % self.cooldown_left())
 
         async with self._lock:
             if not fresh:
@@ -166,13 +185,25 @@ class HalalChecker:
             if wait > 0:
                 await asyncio.sleep(wait)
             started = time.time()
+            self.log("спрашиваю @%s про %s" % (BOT, ticker), "HALAL")
             try:
-                result = await self._ask(ticker)
+                result = await asyncio.wait_for(self._ask(ticker), HARD_TIMEOUT)
+            except asyncio.TimeoutError:
+                self.last_error = "запрос %s завис дольше %d с" % (ticker, HARD_TIMEOUT)
+                self.log("халяль: " + self.last_error, "ERR")
+                result = _unknown("запрос завис дольше %d с" % HARD_TIMEOUT)
             except Exception as e:
-                self.last_error = repr(e)
-                self.log("халяль-запрос %s упал: %r" % (ticker, e), "ERR")
-                result = {"status": UNKNOWN, "note": "ошибка запроса: %r" % e, "ruling": "",
-                          "link": "", "source": "", "coin": ""}
+                wait = int(getattr(e, "seconds", 0) or 0)
+                if type(e).__name__ == "FloodWaitError" and wait:
+                    self.cooldown_until = time.time() + wait
+                    self.last_error = "FloodWait %d с" % wait
+                    self.log("Telegram просит аккаунт подождать %d с — до тех пор "
+                             "сигналы идут с пометкой «не проверено»" % wait, "WARN")
+                    result = _unknown("Telegram просит подождать %d с" % wait)
+                else:
+                    self.last_error = repr(e)
+                    self.log("халяль-запрос %s упал: %r" % (ticker, e), "ERR")
+                    result = _unknown("ошибка запроса: %r" % e)
             finally:
                 self.last_query = time.time()
                 self.queries += 1
@@ -186,25 +217,33 @@ class HalalChecker:
         return result
 
     async def _ask(self, ticker):
-        async with self.client.conversation(
-                BOT, timeout=FIRST_REPLY_TIMEOUT,
-                total_timeout=FIRST_REPLY_TIMEOUT + NEXT_REPLY_TIMEOUT * MAX_MESSAGES) as conv:
-            await conv.send_message(ticker)
-            last = None
-            for i in range(MAX_MESSAGES):
-                try:
-                    msg = await conv.get_response(
-                        timeout=FIRST_REPLY_TIMEOUT if i == 0 else NEXT_REPLY_TIMEOUT)
-                except asyncio.TimeoutError:
-                    break
+        """Отправляем тикер и перечитываем ответы бота, пока не придёт вердикт.
+
+        Перечитываем, а не ждём событий: многие боты сначала пишут «ищу…»,
+        а потом редактируют это же сообщение в ответ. get_messages всегда
+        возвращает текущий текст, так что видны и новые сообщения, и правки.
+        """
+        sent = await self.client.send_message(BOT, ticker)
+        deadline = time.time() + REPLY_TIMEOUT
+        last_text = None
+        while time.time() < deadline:
+            await asyncio.sleep(POLL_INTERVAL)
+            msgs = await self.client.get_messages(BOT, limit=5, min_id=sent.id)
+            for msg in sorted(msgs or [], key=lambda m: m.id):
+                if getattr(msg, "out", False):
+                    continue
                 text = msg.raw_text or ""
-                last = parse_reply(text, ticker)
+                if not text:
+                    continue
                 if has_verdict(text):
-                    return last
-            if last is None:
-                return {"status": UNKNOWN, "note": "бот не ответил за %d с" % FIRST_REPLY_TIMEOUT,
-                        "ruling": "", "link": "", "source": "", "coin": ""}
-            return last
+                    result = parse_reply(text, ticker)
+                    # запоздалый ответ на прошлый вопрос — ждём свой
+                    if not result.get("mismatch"):
+                        return result
+                last_text = text
+        if last_text is not None:
+            return parse_reply(last_text, ticker)
+        return _unknown("бот не ответил за %d с" % REPLY_TIMEOUT)
 
     def export_cache(self):
         return self.cache

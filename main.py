@@ -36,7 +36,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8145739398:AAG3dl79hQnSsTe1KoYGt9hvaaUs
 # Версия кода. Видна в /start, /s и в логе при старте — чтобы сразу отвечать
 # на вопрос «какой код реально крутится на этом сервисе».
 # Поднимать вручную при заметных правках.
-CODE_VERSION = "2026-11-25 halal-autocheck"
+CODE_VERSION = "2026-11-25 halal-poll"
 
 # Render сам подставляет эти переменные в окружение сервиса.
 RENDER_SERVICE = os.environ.get("RENDER_SERVICE_NAME", "")
@@ -791,7 +791,9 @@ async def halal_cmd(message: types.Message, command: CommandObject):
             return await message.answer(
                 f"⚠️ Юзербот не подключён: {html.escape(halal_checker.describe())}",
                 parse_mode="HTML")
-        await message.answer(f"⏳ Спрашиваю @{halal.BOT} про <b>{base}</b>…", parse_mode="HTML")
+        queue = " (сначала дождусь текущей проверки)" if halal_checker.busy else ""
+        await message.answer(f"⏳ Спрашиваю @{halal.BOT} про <b>{base}</b>…{queue}",
+                             parse_mode="HTML")
         v = await halal_checker.check(base, fresh=True)
         save_state()
         verdict = {halal.HARAM: "❌ харам (غير مباح) — сигналы по ней будут блокироваться",
