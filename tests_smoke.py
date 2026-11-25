@@ -393,6 +393,75 @@ async def test_incoming_diagnostics():
     assert main.version_line()
 
 
+# ------------------------------------------------- кнопка «в ЧС» под сигналом
+@check
+async def test_blacklist_button():
+    reset()
+    kb = main.alert_keyboard("TICS")
+    btn = kb.inline_keyboard[0][0]
+    assert btn.callback_data == "bl:add:TICS" and "TICS" in btn.text
+    assert len(main.alert_keyboard("A" * 20).inline_keyboard[0][0].callback_data.encode()) <= 64
+
+    # кнопка уходит только админу: в канале её могли бы нажать подписчики
+    sent = []
+    async def capture(chat, text, **k): sent.append((chat, k.get("reply_markup")))
+    async def zero(sym, cur): return 0.0, 0.0, 0.0
+    main.bot.send_message = capture
+    main.get_long_term_changes = zero
+    main.settings["chat_id"] = 111
+    main.settings["channel_id"] = "@chan"
+    await main.process_candidates([cand("TICSUSDT")], Counter(), time.time())
+    main.bot.send_message = fake_send
+    by_chat = dict(sent)
+    assert by_chat[111] is not None, "у админа нет кнопки"
+    assert by_chat["@chan"] is None, "кнопка попала в канал"
+    assert by_chat[111].inline_keyboard[0][0].callback_data == "bl:add:TICS"
+
+    class Chat:
+        def __init__(self, cid): self.id = cid
+    class Msg:
+        def __init__(self, cid): self.chat, self.markup = Chat(cid), None
+        async def edit_reply_markup(self, reply_markup=None): self.markup = reply_markup
+    class CB:
+        def __init__(self, data, cid=111):
+            self.data, self.message = data, Msg(cid)
+            self.from_user = type("U", (), {"id": 42})()
+            self.toast = None
+        async def answer(self, text=None, show_alert=False): self.toast = text
+
+    cb = CB("bl:add:TICS")
+    await main.on_blacklist_button(cb)
+    assert "TICS" in main.blacklist, "кнопка не добавила в ЧС"
+    assert cb.message.markup.inline_keyboard[0][0].callback_data == "bl:del:TICS"
+    assert "добавлена" in cb.toast
+    with open(STATE) as f:
+        assert "TICS" in json.load(f)["blacklist"], "ЧС после кнопки не сохранился"
+
+    cb = CB("bl:del:TICS")
+    await main.on_blacklist_button(cb)
+    assert "TICS" not in main.blacklist, "откат не сработал"
+    assert cb.message.markup.inline_keyboard[0][0].callback_data == "bl:add:TICS"
+
+    # чужой чат (например, пересланное сообщение) ЧС не меняет
+    cb = CB("bl:add:TICS", cid=999)
+    await main.on_blacklist_button(cb)
+    assert "TICS" not in main.blacklist and "только из чата админа" in cb.toast
+
+    # мусор в callback_data
+    for junk in ("bl:add:", "bl:add:ti cs", "bl:zap:TICS", "bl:add:TICS:x", "bl:add:" + "A" * 30):
+        cb = CB(junk)
+        await main.on_blacklist_button(cb)
+        assert not main.blacklist, "мусор %r изменил ЧС" % junk
+
+    # если сообщение слишком старое и кнопку не обновить, ЧС всё равно меняется
+    class OldMsg(Msg):
+        async def edit_reply_markup(self, reply_markup=None):
+            raise RuntimeError("message is too old")
+    cb = CB("bl:add:OLD"); cb.message = OldMsg(111)
+    await main.on_blacklist_button(cb)
+    assert "OLD" in main.blacklist
+
+
 async def main_run():
     failed = []
     for fn in checks:

@@ -1,6 +1,8 @@
 import asyncio
 import aiohttp
-from aiogram import Bot, Dispatcher, types
+import re
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, CommandObject
 from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
 from aiohttp import web
@@ -31,7 +33,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8145739398:AAG3dl79hQnSsTe1KoYGt9hvaaUs
 # Версия кода. Видна в /start, /s и в логе при старте — чтобы сразу отвечать
 # на вопрос «какой код реально крутится на этом сервисе».
 # Поднимать вручную при заметных правках.
-CODE_VERSION = "2026-09-27 polling-diag"
+CODE_VERSION = "2026-11-25 bl-button"
 
 # Render сам подставляет эти переменные в окружение сервиса.
 RENDER_SERVICE = os.environ.get("RENDER_SERVICE_NAME", "")
@@ -207,6 +209,20 @@ def save_state():
             pass
 
 
+TICKER_RE = re.compile(r"^[A-Z0-9]{1,20}$")
+
+
+def alert_keyboard(base, in_blacklist=False):
+    """Кнопка под сигналом. callback_data: 'bl:add:TICS' / 'bl:del:TICS'."""
+    if in_blacklist:
+        button = InlineKeyboardButton(text="✅ %s в ЧС · ↩️ вернуть" % base,
+                                      callback_data="bl:del:%s" % base)
+    else:
+        button = InlineKeyboardButton(text="🚫 Добавить %s в ЧС" % base,
+                                      callback_data="bl:add:%s" % base)
+    return InlineKeyboardMarkup(inline_keyboard=[[button]])
+
+
 def norm_base(arg):
     """'btc', 'BTCUSDT', ' btc ' -> 'BTC'"""
     coin = (arg or "").strip().upper()
@@ -241,6 +257,43 @@ async def on_handler_error(event: types.ErrorEvent):
 
 
 # ================= TELEGRAM UI =================
+
+@dp.callback_query(F.data.startswith("bl:"))
+async def on_blacklist_button(cb: types.CallbackQuery):
+    parts = (cb.data or "").split(":")
+    if len(parts) != 3 or parts[1] not in ("add", "del"):
+        return await cb.answer("Непонятная кнопка", show_alert=True)
+    action, base = parts[1], parts[2].upper()
+    if not TICKER_RE.match(base):
+        return await cb.answer("Непонятный тикер", show_alert=True)
+
+    # Кнопка ставится только в чат админа, но проверяем и здесь:
+    # иначе её можно было бы нажать из пересланного сообщения.
+    chat_id = getattr(getattr(cb.message, "chat", None), "id", None)
+    if not settings["chat_id"] or chat_id != settings["chat_id"]:
+        log("кнопка ЧС нажата не из чата админа (chat %s, user %s) — отказ"
+            % (chat_id, getattr(cb.from_user, "id", "?")), "WARN")
+        return await cb.answer("Менять ЧС можно только из чата админа", show_alert=True)
+
+    if action == "add":
+        blacklist.add(base)
+        allowlist.discard(base)
+        note = "🚫 %s добавлена в ЧС — сигналов по ней больше не будет" % base
+    else:
+        blacklist.discard(base)
+        note = "↩️ %s убрана из ЧС" % base
+    save_state()
+    log("кнопка: ЧС %s %s (всего %d)" % ("+=" if action == "add" else "-=", base,
+                                          len(blacklist)), "CMD")
+
+    try:
+        await cb.message.edit_reply_markup(
+            reply_markup=alert_keyboard(base, in_blacklist=(action == "add")))
+    except Exception as e:
+        # Например, сообщение слишком старое — ЧС всё равно уже изменён.
+        log("не смог обновить кнопку под сигналом %s: %r" % (base, e), "WARN")
+    await cb.answer(note)
+
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
@@ -1074,7 +1127,8 @@ async def process_candidates(candidates, stats, now):
         log("СИГНАЛ %s: окно -%.2f%%, час -%.2f%%, 24ч %.2f%%, объём %d$"
             % (base_coin, drop, hour_drop, ch_24, int(vol)), "ALERT")
         try:
-            await bot.send_message(settings["chat_id"], alert_text, parse_mode="HTML")
+            await bot.send_message(settings["chat_id"], alert_text, parse_mode="HTML",
+                                   reply_markup=alert_keyboard(base_coin))
         except Exception as e:
             log("не отправилось админу: %r" % e, "ERR")
 
