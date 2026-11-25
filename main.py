@@ -34,7 +34,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8145739398:AAG3dl79hQnSsTe1KoYGt9hvaaUs
 # Версия кода. Видна в /start, /s и в логе при старте — чтобы сразу отвечать
 # на вопрос «какой код реально крутится на этом сервисе».
 # Поднимать вручную при заметных правках.
-CODE_VERSION = "2026-11-25 check-button"
+CODE_VERSION = "2026-11-25 check-buttons-2"
 
 # Render сам подставляет эти переменные в окружение сервиса.
 RENDER_SERVICE = os.environ.get("RENDER_SERVICE_NAME", "")
@@ -212,19 +212,26 @@ def save_state():
 
 TICKER_RE = re.compile(r"^[A-Z0-9]{1,20}$")
 
-# Бот для проверки монеты. Кнопка «Проверка» открывает его со вписанным
-# тикером (ссылка t.me/<бот>?text=<тикер>). Пустое значение убирает кнопку.
-CHECK_BOT = os.environ.get("CHECK_BOT_USERNAME", "CryptoGulfHalal_Bot").strip().lstrip("@")
+# Внешние боты для проверки монеты. Кнопка открывает бота со вписанным
+# тикером (ссылка t.me/<бот>?text=<тикер>). Пустое значение в env убирает кнопку.
+CHECK_BOTS = [
+    (label, os.environ.get(env, default).strip().lstrip("@"))
+    for label, env, default in (
+        ("🕌 Проверка халяль", "CHECK_BOT_USERNAME", "CryptoGulfHalal_Bot"),
+        ("📊 Проверка маркетов", "MARKETS_BOT_USERNAME", "SpreaderApp"),
+    )
+]
 
 
 def alert_keyboard(base, in_blacklist=False):
     """Кнопки под сигналом: проверка во внешнем боте и ЧС.
     callback_data ЧС: 'bl:add:TICS' / 'bl:del:TICS'."""
     rows = []
-    if CHECK_BOT:
-        rows.append([InlineKeyboardButton(
-            text="🔍 Проверка %s" % base,
-            url="https://t.me/%s?text=%s" % (CHECK_BOT, quote(base)))])
+    checks = [InlineKeyboardButton(text=label,
+                                   url="https://t.me/%s?text=%s" % (bot_name, quote(base)))
+              for label, bot_name in CHECK_BOTS if bot_name]
+    if checks:
+        rows.append(checks)
     if in_blacklist:
         rows.append([InlineKeyboardButton(text="✅ %s в ЧС · ↩️ вернуть" % base,
                                           callback_data="bl:del:%s" % base)])

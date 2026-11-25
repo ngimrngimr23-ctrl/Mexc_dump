@@ -399,8 +399,13 @@ def bl_cb(markup):
     return [b.callback_data for row in markup.inline_keyboard for b in row if b.callback_data][0]
 
 
+def check_urls(markup):
+    """{текст кнопки: ссылка} для всех кнопок-ссылок."""
+    return {b.text: b.url for row in markup.inline_keyboard for b in row if b.url}
+
+
 def check_url(markup):
-    urls = [b.url for row in markup.inline_keyboard for b in row if b.url]
+    urls = list(check_urls(markup).values())
     return urls[0] if urls else None
 
 
@@ -411,14 +416,22 @@ async def test_blacklist_button():
     assert bl_cb(kb) == "bl:add:TICS"
     assert len(bl_cb(main.alert_keyboard("A" * 20)).encode()) <= 64
 
-    # кнопка «Проверка» открывает внешнего бота с вписанным тикером
-    assert check_url(kb) == "https://t.me/CryptoGulfHalal_Bot?text=TICS", check_url(kb)
-    assert check_url(main.alert_keyboard("TICS", in_blacklist=True)), \
-        "после нажатия ЧС кнопка проверки пропала"
-    saved = main.CHECK_BOT
-    main.CHECK_BOT = ""
-    assert check_url(main.alert_keyboard("TICS")) is None, "пустой CHECK_BOT должен убирать кнопку"
-    main.CHECK_BOT = saved
+    # кнопки проверки открывают внешних ботов с вписанным тикером
+    urls = check_urls(kb)
+    assert urls == {
+        "🕌 Проверка халяль": "https://t.me/CryptoGulfHalal_Bot?text=TICS",
+        "📊 Проверка маркетов": "https://t.me/SpreaderApp?text=TICS",
+    }, urls
+    assert len(check_urls(main.alert_keyboard("TICS", in_blacklist=True))) == 2, \
+        "после нажатия ЧС кнопки проверки пропали"
+    saved = list(main.CHECK_BOTS)
+    main.CHECK_BOTS[:] = [(label, "") if "маркетов" in label else (label, b) for label, b in saved]
+    assert list(check_urls(main.alert_keyboard("TICS"))) == ["🕌 Проверка халяль"], \
+        "пустое имя бота должно убирать только его кнопку"
+    main.CHECK_BOTS[:] = [(label, "") for label, _ in saved]
+    assert not check_urls(main.alert_keyboard("TICS")), "без ботов кнопок проверки быть не должно"
+    assert bl_cb(main.alert_keyboard("TICS")) == "bl:add:TICS", "кнопка ЧС должна остаться"
+    main.CHECK_BOTS[:] = saved
 
     # кнопка уходит только админу: в канале её могли бы нажать подписчики
     sent = []
