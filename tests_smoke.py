@@ -726,12 +726,21 @@ async def test_halal_blocks_alerts():
     finally:
         main.halal_checker = real
 
-    # без настроек юзербота сигналы идут как раньше
+    # без ключей юзербота сигнал идёт, но с явной пометкой и именем сервиса
     reset()
     main.get_long_term_changes = zero
+    saved_service = main.RENDER_SERVICE
+    main.RENDER_SERVICE = "mexc-dump-old"
     SENT.clear()
     await main.process_candidates([cand("ODDUSDT")], Counter(), time.time())
+    assert len(SENT) == 1 and "проверка не настроена на сервисе mexc-dump-old" in SENT[0], SENT
+
+    # проверку выключили сами — тогда без пометки
+    main.settings["halal_check"] = False
+    main.daily_memory.clear(); SENT.clear()
+    await main.process_candidates([cand("ODDUSDT")], Counter(), time.time())
     assert len(SENT) == 1 and "Халяль" not in SENT[0]
+    main.RENDER_SERVICE = saved_service
 
 
 @check

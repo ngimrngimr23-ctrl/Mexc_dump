@@ -36,7 +36,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8145739398:AAG3dl79hQnSsTe1KoYGt9hvaaUs
 # Версия кода. Видна в /start, /s и в логе при старте — чтобы сразу отвечать
 # на вопрос «какой код реально крутится на этом сервисе».
 # Поднимать вручную при заметных правках.
-CODE_VERSION = "2026-11-25 halal-noruling"
+CODE_VERSION = "2026-11-25 halal-visible"
 
 # Render сам подставляет эти переменные в окружение сервиса.
 RENDER_SERVICE = os.environ.get("RENDER_SERVICE_NAME", "")
@@ -1206,6 +1206,11 @@ async def process_candidates(candidates, stats, now):
                 else:
                     halal_line = "🕌 Халяль: не проверено (%s)\n" % html.escape(
                         verdict.get("note") or "нет ответа")
+        elif settings["halal_check"]:
+            # Проверка включена, но на этом сервисе нет ключей юзербота. Молча
+            # пропускать нельзя: так сигнал без проверки неотличим от проверенного.
+            where = (" на сервисе %s" % RENDER_SERVICE) if RENDER_SERVICE else ""
+            halal_line = "🕌 Халяль: проверка не настроена%s (нет TG_SESSION)\n" % html.escape(where)
 
         price = cand["price"]
         daily_memory[pair] = {
